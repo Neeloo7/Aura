@@ -5,4 +5,6 @@ chroma.sqlite3
 aura_memory/
 .env
 *.mp3
-*.wav
+*.wav
+screen_context.png
+

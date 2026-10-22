@@ -7,6 +7,7 @@ import difflib
 import glob
 import os
 import subprocess
+import tempfile
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -539,6 +540,37 @@ def _screenshot() -> str:
     return f"Screenshot saved to {path}."
 
 
+def capture_screen_context(save_path: str | None = None) -> str:
+    """Capture the current active screen state into a temporary 'screen_context.png'.
+
+    Registered tool for Ollama screen vision and desktop context analysis.
+    """
+    try:
+        import pyautogui
+    except ImportError:
+        return "Screen vision failed: pyautogui is not installed."
+
+    try:
+        if save_path:
+            target_path = Path(save_path)
+        else:
+            target_path = Path(tempfile.gettempdir()) / "screen_context.png"
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        img = pyautogui.screenshot()
+        img.save(str(target_path))
+
+        # Also update local working copy for direct model/file access
+        try:
+            img.save("screen_context.png")
+        except Exception:
+            pass
+
+        return f"Active screen context captured and saved to '{target_path.resolve()}'."
+    except Exception as exc:
+        return f"Failed to capture screen context: {exc}"
+
+
 def system_control(action: str) -> str:
     """Volume, media keys, screenshot, and live CPU/RAM/battery stats."""
     act = _normalize(action).replace(" ", "_")
@@ -549,6 +581,8 @@ def system_control(action: str) -> str:
         "play_pause": lambda: (_press_vk(_VK_MEDIA_PLAY_PAUSE), "Play/pause toggled."),
         "next_track": lambda: (_press_vk(_VK_MEDIA_NEXT_TRACK), "Skipped to next track."),
         "screenshot": _screenshot,
+        "capture_screen_context": capture_screen_context,
+        "screen_context": capture_screen_context,
         "system_stats": _system_stats,
         "stats": _system_stats,
     }
@@ -624,6 +658,7 @@ OLLAMA_TOOLS_SCHEMA: list[dict] = [
                             "play_pause",
                             "next_track",
                             "screenshot",
+                            "capture_screen_context",
                             "system_stats",
                         ],
                         "description": "Which OS action to run.",
@@ -633,12 +668,28 @@ OLLAMA_TOOLS_SCHEMA: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "capture_screen_context",
+            "description": (
+                "Capture the current desktop screen into a temporary 'screen_context.png' for visual context "
+                "and UI analysis. Call this when the user asks what is on their screen, "
+                "to inspect an open document or application window, or to see what they are currently viewing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 _TOOL_MAP = {
     "open_app_or_website": open_app_or_website,
     "close_application": close_application,
     "system_control": system_control,
+    "capture_screen_context": capture_screen_context,
 }
 
 
