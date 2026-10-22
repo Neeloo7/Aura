@@ -4,3 +4,5 @@ __pycache__/
 chroma.sqlite3
 aura_memory/
 .env
+*.mp3
+*.wav
