@@ -52,7 +52,7 @@ os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--ignore-gpu-blocklist --en
 
 if sys.platform == "win32":
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud.app")
     except Exception:
         pass
 
@@ -2990,7 +2990,7 @@ def main():
     # 1. Initialize Windows AppUserModelID immediately before anything else
     if sys.platform == "win32":
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud.app")
         except Exception:
             pass
 
