@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import difflib
+import glob
 import os
 import subprocess
 import webbrowser
@@ -26,8 +27,251 @@ _VK_MEDIA_PLAY_PAUSE = 0xB3
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
 
+# Custom App Aliases: maps common application names to candidate paths, URIs, or commands.
+# Environment variables like %LocalAppData%, %ProgramFiles%, %APPDATA% are expanded dynamically.
+CUSTOM_APP_ALIASES: dict[str, list[str]] = {
+    "obsidian": [
+        r"%LocalAppData%\Programs\Obsidian\Obsidian.exe",
+        r"%ProgramFiles%\Obsidian\Obsidian.exe",
+        r"%ProgramFiles(x86)%\Obsidian\Obsidian.exe",
+        "obsidian://",
+        "obsidian",
+    ],
+    "discord": [
+        r"%LocalAppData%\Discord\Update.exe --processStart Discord.exe",
+        r"%LocalAppData%\Discord\app-*\Discord.exe",
+        "discord://",
+        "discord",
+    ],
+    "vscode": [
+        r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles%\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles(x86)%\Microsoft VS Code\Code.exe",
+        "vscode://",
+        "code",
+    ],
+    "vs code": [
+        r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles%\Microsoft VS Code\Code.exe",
+        "vscode://",
+        "code",
+    ],
+    "visual studio code": [
+        r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles%\Microsoft VS Code\Code.exe",
+        "vscode://",
+        "code",
+    ],
+    "code": [
+        r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe",
+        "code",
+    ],
+    "cursor": [
+        r"%LocalAppData%\Programs\cursor\Cursor.exe",
+        "cursor://",
+        "cursor",
+    ],
+    "spotify": [
+        "spotify:",
+        r"%AppData%\Spotify\Spotify.exe",
+        r"%ProgramFiles%\Spotify\Spotify.exe",
+        "spotify",
+    ],
+    "chrome": [
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+        r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+        "chrome",
+    ],
+    "google chrome": [
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+        "chrome",
+    ],
+    "brave": [
+        r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "brave",
+    ],
+    "edge": [
+        "microsoft-edge:",
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+        "msedge",
+    ],
+    "microsoft edge": [
+        "microsoft-edge:",
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+        "msedge",
+    ],
+    "steam": [
+        "steam://",
+        r"%ProgramFiles(x86)%\Steam\steam.exe",
+        r"%ProgramFiles%\Steam\steam.exe",
+        "steam",
+    ],
+    "slack": [
+        r"%LocalAppData%\slack\slack.exe",
+        "slack://",
+        "slack",
+    ],
+    "notion": [
+        r"%LocalAppData%\Programs\Notion\Notion.exe",
+        "notion://",
+        "notion",
+    ],
+    "telegram": [
+        r"%AppData%\Telegram Desktop\Telegram.exe",
+        "tg://",
+        "telegram",
+    ],
+    "whatsapp": [
+        r"%LocalAppData%\WhatsApp\WhatsApp.exe",
+        "whatsapp:",
+        "whatsapp",
+    ],
+    "terminal": [
+        "wt",
+        "powershell",
+    ],
+    "windows terminal": [
+        "wt",
+    ],
+    "wt": [
+        "wt",
+    ],
+    "powershell": [
+        "pwsh",
+        "powershell",
+    ],
+    "cmd": [
+        "cmd",
+    ],
+    "command prompt": [
+        "cmd",
+    ],
+    "notepad": [
+        "notepad",
+    ],
+    "calculator": [
+        "calc",
+    ],
+    "calc": [
+        "calc",
+    ],
+    "settings": [
+        "ms-settings:",
+    ],
+    "windows settings": [
+        "ms-settings:",
+    ],
+    "recycle bin": [
+        "shell:RecycleBinFolder",
+    ],
+    "recyclebin": [
+        "shell:RecycleBinFolder",
+    ],
+    "bin": [
+        "shell:RecycleBinFolder",
+    ],
+    "trash": [
+        "shell:RecycleBinFolder",
+    ],
+    "task manager": [
+        "taskmgr",
+    ],
+    "taskmgr": [
+        "taskmgr",
+    ],
+    "file explorer": [
+        "explorer",
+    ],
+    "explorer": [
+        "explorer",
+    ],
+    "files": [
+        "explorer",
+    ],
+    "paint": [
+        "mspaint",
+    ],
+    "snipping tool": [
+        "ms-screenclip:",
+        "snippingtool",
+    ],
+    "camera": [
+        "microsoft.windows.camera:",
+    ],
+    "vlc": [
+        r"%ProgramFiles%\VideoLAN\VLC\vlc.exe",
+        r"%ProgramFiles(x86)%\VideoLAN\VLC\vlc.exe",
+        "vlc",
+    ],
+    "postman": [
+        r"%LocalAppData%\Postman\Postman.exe",
+        "postman://",
+        "postman",
+    ],
+    "github desktop": [
+        r"%LocalAppData%\GitHubDesktop\GitHubDesktop.exe",
+        "github-windows://",
+    ],
+    "docker": [
+        r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe",
+    ],
+    "docker desktop": [
+        r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe",
+    ],
+    "word": [
+        "winword",
+    ],
+    "excel": [
+        "excel",
+    ],
+    "powerpoint": [
+        "powerpnt",
+    ],
+    "ableton": [
+        r"%ProgramFiles%\Ableton\*\Program\Ableton Live*.exe",
+        r"%ProgramData%\Ableton\*\Program\Ableton Live*.exe",
+        "ableton",
+    ],
+    "valorant": [
+        r"%RiotGames%\Riot Client\RiotClientServices.exe",
+        "valorant",
+    ],
+}
+
+# Process name hints for closing applications via psutil
+_APP_PROCESS_HINTS: dict[str, list[str]] = {
+    "obsidian": ["obsidian.exe"],
+    "discord": ["discord.exe"],
+    "vscode": ["code.exe"],
+    "vs code": ["code.exe"],
+    "visual studio code": ["code.exe"],
+    "code": ["code.exe"],
+    "cursor": ["cursor.exe"],
+    "spotify": ["spotify.exe"],
+    "chrome": ["chrome.exe"],
+    "google chrome": ["chrome.exe"],
+    "brave": ["brave.exe"],
+    "edge": ["msedge.exe"],
+    "microsoft edge": ["msedge.exe"],
+    "steam": ["steam.exe", "steamservice.exe"],
+    "slack": ["slack.exe"],
+    "notion": ["notion.exe"],
+    "telegram": ["telegram.exe"],
+    "whatsapp": ["whatsapp.exe"],
+    "terminal": ["windowsterminal.exe"],
+    "notepad": ["notepad.exe"],
+    "calculator": ["calculatorapp.exe", "calc.exe"],
+    "task manager": ["taskmgr.exe"],
+    "vlc": ["vlc.exe"],
+    "docker": ["docker desktop.exe"],
+}
+
 _URI_ALIASES: dict[str, tuple[str, bool]] = {
-    # target -> (command, use_shell_start)
+    # Legacy target -> (command, use_shell_start)
     "settings": ("ms-settings:", True),
     "windows settings": ("ms-settings:", True),
     "bin": ("shell:RecycleBinFolder", True),
@@ -102,15 +346,86 @@ def _installed_app_match(target: str) -> str | None:
     return hits[0] if hits else None
 
 
+def _launch_app_alias(target: str) -> tuple[str, bool]:
+    """Check custom app alias dictionary using exact and fuzzy matching.
+
+    Returns (matched_key, success).
+    """
+    needle = _normalize(target)
+
+    # 1. Exact match
+    matched_key = needle if needle in CUSTOM_APP_ALIASES else None
+
+    # 2. Fuzzy match against alias dictionary
+    if not matched_key:
+        hits = difflib.get_close_matches(needle, list(CUSTOM_APP_ALIASES.keys()), n=1, cutoff=0.7)
+        if hits:
+            matched_key = hits[0]
+
+    if not matched_key:
+        return "", False
+
+    candidates = CUSTOM_APP_ALIASES[matched_key]
+    flags = CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    for cand in candidates:
+        expanded = os.path.expandvars(cand)
+
+        # A. Wildcard/glob file path (e.g., app-*\Discord.exe or Ableton Live*.exe)
+        if "*" in expanded:
+            matches = glob.glob(expanded)
+            if matches:
+                exe = sorted(matches)[-1]
+                try:
+                    subprocess.Popen(f'"{exe}"', shell=True, creationflags=flags)
+                    return matched_key, True
+                except Exception:
+                    continue
+
+        # B. Direct executable path on disk
+        parts = expanded.split(" --", 1)
+        base_path = parts[0].strip(' "')
+        if os.path.isfile(base_path) or os.path.exists(base_path):
+            try:
+                cmd = expanded if "--" in expanded else f'"{expanded}"'
+                subprocess.Popen(cmd, shell=True, creationflags=flags)
+                return matched_key, True
+            except Exception:
+                continue
+
+        # C. URI schemes (e.g., obsidian://, discord://, spotify:, ms-settings:, shell:)
+        if ":" in cand and not cand.startswith(("\\", "/", "C:", "c:", "D:", "d:")) and not os.path.isabs(expanded):
+            try:
+                subprocess.Popen(f'start "" {cand}', shell=True, creationflags=flags)
+                return matched_key, True
+            except Exception:
+                continue
+
+        # D. Direct shell command (e.g., notepad, calc, code, wt)
+        if " " not in cand and not cand.endswith(".exe"):
+            try:
+                subprocess.Popen(cand, shell=True, creationflags=flags)
+                return matched_key, True
+            except Exception:
+                continue
+
+    return matched_key, False
+
+
 def open_app_or_website(target_name: str) -> str:
-    """3-tier launcher: Windows URI/shell -> AppOpener fuzzy match -> web."""
+    """3-tier launcher: Custom App Aliases / URIs -> AppOpener fuzzy match -> web."""
     raw = (target_name or "").strip()
     if not raw:
         return "Need an app or site name to open."
 
     key = _normalize(raw)
 
-    # Tier 1 — direct Windows URI / shell commands.
+    # Tier 1 — Custom App Aliases with fuzzy matching (Obsidian, Discord, VS Code, Chrome...)
+    matched_alias, success = _launch_app_alias(key)
+    if success:
+        return f"Opened {matched_alias.title()}."
+
+    # Legacy direct Windows URI / shell commands
     if key in _URI_ALIASES:
         command, use_start = _URI_ALIASES[key]
         try:
@@ -119,7 +434,7 @@ def open_app_or_website(target_name: str) -> str:
         except Exception as exc:
             return f"Failed to open {raw}: {exc}"
 
-    # Tier 2 — any installed app (Ableton, Valorant, Steam, Chrome, VS Code…).
+    # Tier 2 — AppOpener fuzzy match against all installed Windows applications
     matched = _installed_app_match(key)
     if matched:
         try:
@@ -140,20 +455,48 @@ def open_app_or_website(target_name: str) -> str:
 
 
 def close_application(app_name: str) -> str:
-    """Close via AppOpener fuzzy match, then psutil process-name fallback."""
+    """Close via custom process hints, AppOpener fuzzy match, then psutil fallback."""
     raw = (app_name or "").strip()
     if not raw:
         return "Need an application name to close."
 
+    key = _normalize(raw)
     closed_via_opener = False
+
+    # Check custom alias hints for exact process names
+    process_targets = []
+    if key in _APP_PROCESS_HINTS:
+        process_targets.extend(_APP_PROCESS_HINTS[key])
+    else:
+        # Fuzzy match key against hints
+        hits = difflib.get_close_matches(key, list(_APP_PROCESS_HINTS.keys()), n=1, cutoff=0.7)
+        if hits:
+            process_targets.extend(_APP_PROCESS_HINTS[hits[0]])
+
+    # Terminate matching target processes directly if found
+    killed = []
+    if process_targets:
+        targets_lower = {p.lower() for p in process_targets}
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pname = (proc.info["name"] or "").lower()
+                if pname in targets_lower:
+                    proc.terminate()
+                    killed.append(pname)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if killed:
+            return f"Closed {', '.join(sorted(set(killed)))}."
+
+    # Try AppOpener
     try:
         app_close(raw, match_closest=True, output=False)
         closed_via_opener = True
     except Exception:
         closed_via_opener = False
 
-    needle = _normalize(raw).replace(" ", "")
-    killed = []
+    # psutil fallback
+    needle = key.replace(" ", "")
     for proc in psutil.process_iter(["pid", "name"]):
         try:
             pname = (proc.info["name"] or "").lower()
