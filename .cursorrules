@@ -1,0 +1,24 @@
+# AI-ru (AURA Next-Gen) Master Architecture & Engineering Rules
+
+## 1. Project Overview
+AI-ru is a privacy-first, locally deployed, ultra-low-latency OS-level AI companion running on Windows 11 (8GB VRAM GPU). It combines:
+1. Edge-quantized LLM execution via Ollama (`qwen2.5:7b` / Dynamic GGUF) with Flash Attention and `q8_0` KV-cache quantization.
+2. Universal OS-level function calling (opening/closing any desktop app, system URIs, media/volume controls, system telemetry).
+3. Near-zero latency full-duplex voice pipeline (VAD -> `faster-whisper` Int8 STT -> Streaming LLM Sentence Chunking -> local neural TTS).
+4. Multi-tier local RAG memory (`aura_memory` via SQLite + ChromaDB).
+5. Always-on, frameless PyQt6 Desktop HUD + System Tray companion (`gui.py`).
+
+## 2. Strict File & Module Separation (Parallel Team Workflow)
+ NEVER merge everything into a single giant file. Strictly maintain these modular boundaries so Person A (Backend) and Person B (GUI) never have merge conflicts:
+- `config.py`: Central configuration (Model names, hotkeys, audio settings, system prompt).
+- `os_tools.py` (Person A): Universal application launcher (3-tier: Windows URI schemes -> `AppOpener` fuzzy match -> Web fallback), process killer (`psutil`), system stats, and media/volume control.
+- `brain.py` (Person A): Ollama async/streaming client, native tool-calling dispatcher, SQLite/ChromaDB memory hook, and real-time sentence-boundary chunker (yields complete clauses on `.`, `!`, `?` for zero-latency TTS).
+- `voice.py` (Person A): Thread-safe voice engine using `faster-whisper` (STT) and `edge-tts` / `pyttsx3` fallback with `pygame`/`sounddevice` playback. Must support immediate interruption (barge-in).
+- `gui.py` (Person B): Standalone PyQt6 frameless, translucent, always-on-top HUD window + System Tray + global hotkey (`Alt+Space`). MUST include a standalone `MockBackend` mode so `python gui.py` can be run and tested independently without Ollama or Voice installed.
+- `main.py` (Integration): Connects `gui.py` signals (`PyQt6.QtCore.pyqtSignal`) to `brain.py` and `voice.py` worker threads.
+
+## 3. Coding Standards
+- Always use `.venv` Python environment.
+- Never block the PyQt6 main UI thread with LLM inference or audio recording; always use `QThread` or Python `threading.Thread` + `queue.Queue`.
+- Keep spoken LLM responses concise (1-2 punchy sentences) unless asked for detailed code/explanations.
+- Do not delete or overwrite existing `aura_memory` data.

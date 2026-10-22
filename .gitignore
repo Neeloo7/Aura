@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+chroma.sqlite3
+aura_memory/
+.env
