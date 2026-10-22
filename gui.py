@@ -29,6 +29,7 @@ Requires: PyQt6, PyQt6-WebEngine, numpy
 from __future__ import annotations
 
 import colorsys
+import ctypes
 import html
 import inspect
 import json
@@ -48,6 +49,12 @@ import numpy as np
 
 # Chromium flags must be set before Qt creates the web engine.
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--ignore-gpu-blocklist --enable-gpu-rasterization")
+
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud")
+    except Exception:
+        pass
 
 from PyQt6.QtCore import (QCoreApplication, QEasingCurve, QEvent, QPointF, QPropertyAnimation, QRect, QRectF, Qt,
                           QTimer, QUrl, QVariantAnimation, pyqtSignal, QThread)
@@ -2006,8 +2013,25 @@ class MiniOrb(QWidget):
 
 
 # --------------------------------------------------------------------------------------
-# Background Worker Thread to execute Ollama Brain / Tool Calls safely without freezing GUI
+# Background Worker Threads to execute Ollama Brain / Tool Calls & Model Warm-up safely
 # --------------------------------------------------------------------------------------
+class WarmupWorker(QThread):
+    """Silently pre-loads the Ollama 7B model into GPU VRAM in background without blocking the UI."""
+
+    def run(self):
+        try:
+            import ollama
+            import config
+
+            ollama.chat(
+                model=config.OLLAMA_MODEL,
+                messages=[{"role": "user", "content": "ping"}],
+                options={"num_predict": 1, "temperature": 0.0},
+            )
+        except Exception:
+            pass
+
+
 class BackendWorker(QThread):
     response_ready = pyqtSignal(str)
     thought_ready = pyqtSignal(str)
@@ -2232,6 +2256,13 @@ class AiruGUI(QWidget):
         self.move(scr.center() - self.rect().center())
         self.dock.entry.setFocus()
         self._orb_timer.start(900)
+
+        # Trigger silent background warm-up of Ollama 7B model
+        QTimer.singleShot(400, self._trigger_warmup)
+
+    def _trigger_warmup(self):
+        self._warmup_worker = WarmupWorker()
+        self._warmup_worker.start()
 
     def _handle_backend_query(self, text):
         self.update_status("THINKING")
@@ -2956,20 +2987,27 @@ AuraGUI = AuraWindow = AiruGUI
 # Demo harness (not used by the backend)
 # --------------------------------------------------------------------------------------
 def main():
+    # 1. Initialize Windows AppUserModelID immediately before anything else
     if sys.platform == "win32":
         try:
-            import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("airu.orb.hud")
         except Exception:
             pass
+
+    # 2. Build QApplication and set app icon BEFORE building windows
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app_icon = make_app_icon(THEMES.get("Neon", ((26, 170, 255), (0, 76, 210)))[0])
+    app.setWindowIcon(app_icon)
+
     f = QFont()
     f.setFamilies(FONT_FAMILIES)
     f.setPointSize(10)
     app.setFont(f)
+
+    # 3. Create window (inherits AppUserModelID and app icon)
     win = AiruGUI()
-    app.setWindowIcon(win.icon)
+    win.setWindowIcon(app_icon)
     win.start()
     if "--background" not in sys.argv:
         QTimer.singleShot(500, lambda: win.add_message(
