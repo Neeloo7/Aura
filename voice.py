@@ -2,11 +2,11 @@
 
 Implements:
 1. Speech-to-Text (STT): faster-whisper (tiny.en/base.en) with int8 quantization
-   and sounddevice microphone recording loop.
-2. Text-to-Speech (TTS): edge-tts async neural synthesis (with pyttsx3 fallback)
-   and non-blocking asynchronous pygame playback with immediate barge-in interruption.
+   and sounddevice microphone recording loop (lazy initialized).
+2. Text-to-Speech (TTS): completely non-blocking background queue with edge-tts
+   (and pyttsx3 fallback), pygame mixer audio playback, and instant barge-in.
 3. Sentence Chunking: streaming sentence boundary generator (.!? splitting)
-   for zero-perceived latency speech synthesis while LLM streams output.
+   for zero-perceived latency speech pipelining while LLM streams output.
 """
 
 from __future__ import annotations
@@ -19,13 +19,12 @@ import sys
 import tempfile
 import threading
 import time
+
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import numpy as np
-import pygame
-import sounddevice as sd
-from faster_whisper import WhisperModel
 
 import config
 
@@ -90,7 +89,6 @@ class SentenceChunker:
         tail = "".join(self._buffer).strip()
         self._buffer = []
         if tail:
-            # Strip remaining trailing punctuation or clean up
             return [tail]
         return []
 
@@ -139,12 +137,15 @@ def iter_sentence_chunks(stream: Iterable[str]) -> Iterator[str]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Text-to-Speech (TTS) Engine with Asynchronous Playback & Barge-In
+# 2. Text-to-Speech (TTS) Engine - 100% Non-Blocking Asynchronous Queue
 # ---------------------------------------------------------------------------
 
 
 class TextToSpeech:
-    """Thread-safe neural TTS engine with pygame audio queue and barge-in interruption."""
+    """Thread-safe neural TTS engine with dedicated background synthesis & playback.
+
+    Calls to `speak()` never block the calling thread or terminal input loop.
+    """
 
     def __init__(
         self,
@@ -154,53 +155,60 @@ class TextToSpeech:
         self.voice = voice or getattr(config, "TTS_VOICE", "en-US-AriaNeural")
         self.use_edge = use_edge
 
-        # Pygame mixer initialization for low-latency playback
         self._mixer_lock = threading.Lock()
-        self._ensure_mixer()
+        self._mixer_initialized = False
 
-        # Playback queue and worker thread
-        self._play_queue: queue.Queue[str | None] = queue.Queue()
+        # Queue holding text strings to be synthesized and spoken in background
+        self._text_queue: queue.Queue[str | None] = queue.Queue()
         self._interrupt_event = threading.Event()
         self._is_speaking = False
-        self._worker_thread = threading.Thread(target=self._playback_worker, daemon=True)
+
+        # Optional pyttsx3 fallback engine (lazy initialized)
+        self._pyttsx_engine = None
+
+        # Dedicated background worker for synthesis + playback
+        self._worker_thread = threading.Thread(target=self._speech_worker, daemon=True)
         self._worker_thread.start()
 
-        # Optional pyttsx3 fallback engine
-        self._pyttsx_engine = None
-        if _HAS_PYTTSX3:
-            try:
-                self._pyttsx_engine = pyttsx3.init()
-                self._pyttsx_engine.setProperty("rate", 195)
-            except Exception:
-                self._pyttsx_engine = None
-
     def _ensure_mixer(self) -> None:
+        """Lazily initialize pygame.mixer on demand in background thread."""
         with self._mixer_lock:
-            if not pygame.mixer.get_init():
+            if not self._mixer_initialized:
                 try:
-                    # Low latency buffer: 512 samples
-                    pygame.mixer.init(frequency=24000, size=-16, channels=2, buffer=512)
+                    import pygame
+
+                    if not pygame.mixer.get_init():
+                        pygame.mixer.init(frequency=24000, size=-16, channels=2, buffer=512)
+                    self._mixer_initialized = True
                 except Exception:
-                    pygame.mixer.init()
+                    try:
+                        import pygame
+
+                        pygame.mixer.init()
+                        self._mixer_initialized = True
+                    except Exception:
+                        pass
 
     def interrupt(self) -> None:
-        """Immediately stop ongoing audio playback and clear queued speech (Barge-In)."""
+        """Immediately stop ongoing audio playback and discard queued speech (Barge-In)."""
         self._interrupt_event.set()
+
+        # Stop currently playing pygame audio
         with self._mixer_lock:
             try:
+                import pygame
+
                 if pygame.mixer.get_init():
                     pygame.mixer.music.stop()
                     pygame.mixer.music.unload()
             except Exception:
                 pass
 
-        # Drain the playback queue
-        while not self._play_queue.empty():
+        # Drain the text queue
+        while not self._text_queue.empty():
             try:
-                item = self._play_queue.get_nowait()
-                if item and os.path.exists(item):
-                    self._safe_remove(item)
-                self._play_queue.task_done()
+                self._text_queue.get_nowait()
+                self._text_queue.task_done()
             except queue.Empty:
                 break
 
@@ -208,10 +216,30 @@ class TextToSpeech:
         self._interrupt_event.clear()
 
     def is_speaking(self) -> bool:
-        """Check if audio is currently playing or queued."""
-        return self._is_speaking or not self._play_queue.empty()
+        """Check if audio is currently playing or waiting in queue."""
+        return self._is_speaking or not self._text_queue.empty()
 
-    def synthesize(self, text: str, output_path: str | None = None) -> str:
+    def speak(self, text: str, interrupt_current: bool = False) -> None:
+        """Queue text for speech synthesis and playback in background (completely non-blocking)."""
+        if not text or not text.strip():
+            return
+        if interrupt_current:
+            self.interrupt()
+        self._text_queue.put(text.strip())
+
+    def speak_stream(self, token_stream: Iterable[str], interrupt_current: bool = False) -> None:
+        """Non-blocking: chunks tokens and feeds completed sentences into background speech queue."""
+        if interrupt_current:
+            self.interrupt()
+
+        for sentence in iter_sentence_chunks(token_stream):
+            if self._interrupt_event.is_set():
+                break
+            clean_sentence = sentence.strip()
+            if clean_sentence:
+                self.speak(clean_sentence)
+
+    def synthesize_to_file(self, text: str, output_path: str | None = None) -> str:
         """Synthesize text to an audio file (using edge-tts with pyttsx3 fallback)."""
         text = text.strip()
         if not text:
@@ -234,13 +262,15 @@ class TextToSpeech:
                         return output_path
                 finally:
                     loop.close()
-            except Exception as exc:
-                # Fallback to local offline TTS
+            except Exception:
                 pass
 
-        # Attempt 2: pyttsx3 offline fallback
-        if self._pyttsx_engine is not None:
+        # Attempt 2: pyttsx3 offline fallback (lazy initialized)
+        if _HAS_PYTTSX3:
             try:
+                if self._pyttsx_engine is None:
+                    self._pyttsx_engine = pyttsx3.init()
+                    self._pyttsx_engine.setProperty("rate", 195)
                 wav_path = output_path.replace(".mp3", ".wav")
                 self._pyttsx_engine.save_to_file(text, wav_path)
                 self._pyttsx_engine.runAndWait()
@@ -253,57 +283,46 @@ class TextToSpeech:
 
         return ""
 
-    def speak(self, text: str, interrupt_current: bool = False) -> None:
-        """Synthesize and queue a single sentence/statement for immediate playback."""
-        if interrupt_current:
-            self.interrupt()
-
-        audio_file = self.synthesize(text)
-        if audio_file:
-            self._play_queue.put(audio_file)
-
-    def speak_stream(self, token_stream: Iterable[str], interrupt_current: bool = False) -> None:
-        """Direct pipeline: consume streaming LLM tokens, chunk on punctuation,
-
-        and immediately trigger speech synthesis for each clause while generation continues.
-        """
-        if interrupt_current:
-            self.interrupt()
-
-        for sentence in iter_sentence_chunks(token_stream):
-            if self._interrupt_event.is_set():
-                break
-            clean_sentence = sentence.strip()
-            if clean_sentence:
-                audio_file = self.synthesize(clean_sentence)
-                if audio_file and not self._interrupt_event.is_set():
-                    self._play_queue.put(audio_file)
-
-    def _playback_worker(self) -> None:
-        """Background daemon thread playing audio files sequentially."""
+    def _speech_worker(self) -> None:
+        """Background daemon thread: synthesizes and plays queued sentences sequentially."""
         while True:
-            audio_path = self._play_queue.get()
-            if audio_path is None:
+            text = self._text_queue.get()
+            if text is None:
                 break
 
-            if self._interrupt_event.is_set() or not os.path.exists(audio_path):
-                self._safe_remove(audio_path)
-                self._play_queue.task_done()
+            if self._interrupt_event.is_set():
+                self._text_queue.task_done()
                 continue
 
             self._is_speaking = True
+            audio_path = ""
             try:
+                # 1. Synthesize audio file
+                audio_path = self.synthesize_to_file(text)
+                if not audio_path or self._interrupt_event.is_set():
+                    if audio_path:
+                        self._safe_remove(audio_path)
+                    self._is_speaking = False
+                    self._text_queue.task_done()
+                    continue
+
+                # 2. Play audio via pygame mixer
+                import pygame
+
+                self._ensure_mixer()
                 with self._mixer_lock:
-                    self._ensure_mixer()
                     pygame.mixer.music.load(audio_path)
                     pygame.mixer.music.play()
 
-                # Wait for audio playback to finish or interruption to occur
+                # 3. Wait for playback while checking for interruption
                 while True:
                     if self._interrupt_event.is_set():
                         with self._mixer_lock:
-                            pygame.mixer.music.stop()
-                            pygame.mixer.music.unload()
+                            try:
+                                pygame.mixer.music.stop()
+                                pygame.mixer.music.unload()
+                            except Exception:
+                                pass
                         break
                     with self._mixer_lock:
                         busy = pygame.mixer.music.get_busy()
@@ -314,14 +333,10 @@ class TextToSpeech:
             except Exception:
                 pass
             finally:
-                with self._mixer_lock:
-                    try:
-                        pygame.mixer.music.unload()
-                    except Exception:
-                        pass
-                self._safe_remove(audio_path)
+                if audio_path:
+                    self._safe_remove(audio_path)
                 self._is_speaking = False
-                self._play_queue.task_done()
+                self._text_queue.task_done()
 
     @staticmethod
     def _safe_remove(path: str) -> None:
@@ -333,7 +348,7 @@ class TextToSpeech:
 
 
 # ---------------------------------------------------------------------------
-# 3. Speech-to-Text (STT) Engine with faster-whisper and sounddevice
+# 3. Speech-to-Text (STT) Engine (Lazy-Initialized)
 # ---------------------------------------------------------------------------
 
 
@@ -350,12 +365,22 @@ class SpeechToText:
         self.model_size = model_size or getattr(config, "WHISPER_MODEL", "tiny.en")
         self.sample_rate = sample_rate or getattr(config, "AUDIO_SAMPLE_RATE", 16000)
 
-        # Device selection: prefer CUDA if available, fallback to CPU
-        configured_device = device or getattr(config, "WHISPER_DEVICE", "auto")
-        configured_compute = compute_type or getattr(config, "WHISPER_COMPUTE_TYPE", "int8")
+        # Device selection preferences
+        self.configured_device = device or getattr(config, "WHISPER_DEVICE", "auto")
+        self.configured_compute = compute_type or getattr(config, "WHISPER_COMPUTE_TYPE", "int8")
 
-        self.device, self.compute_type = self._resolve_device(configured_device, configured_compute)
-        self.model = self._init_model()
+        self.device, self.compute_type = self._resolve_device(self.configured_device, self.configured_compute)
+        self._model: Any = None
+        self._init_lock = threading.Lock()
+
+    @property
+    def model(self) -> Any:
+        """Lazily initialize WhisperModel upon first actual transcription."""
+        if self._model is None:
+            with self._init_lock:
+                if self._model is None:
+                    self._model = self._init_model()
+        return self._model
 
     @staticmethod
     def _resolve_device(device_pref: str, compute_pref: str) -> tuple[str, str]:
@@ -365,7 +390,6 @@ class SpeechToText:
         if device_pref == "cpu":
             return "cpu", "int8"
 
-        # Auto detection: check ctranslate2 CUDA device count
         try:
             import ctranslate2
 
@@ -375,32 +399,30 @@ class SpeechToText:
             pass
         return "cpu", "int8"
 
-    def _init_model(self) -> WhisperModel:
+    def _init_model(self) -> Any:
         """Initialize faster-whisper WhisperModel with automatic fallback to CPU."""
+        from faster_whisper import WhisperModel
+
         try:
             return WhisperModel(
                 self.model_size,
                 device=self.device,
                 compute_type=self.compute_type,
             )
-        except Exception as exc:
+        except Exception:
             # Fallback to CPU int8 if CUDA libraries or drivers fail
-            if self.device != "cpu":
-                self.device = "cpu"
-                self.compute_type = "int8"
-                return WhisperModel("tiny.en", device="cpu", compute_type="int8")
-            raise exc
+            self.device = "cpu"
+            self.compute_type = "int8"
+            return WhisperModel("tiny.en", device="cpu", compute_type="int8")
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a 16kHz float32 audio buffer into text with sub-200ms latency."""
         if audio is None or len(audio) == 0:
             return ""
 
-        # Normalize to float32 mono [-1.0, 1.0]
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        # Faster-whisper transcription with beam_size=1 and vad_filter for maximum speed
         segments, _ = self.model.transcribe(
             audio,
             language="en",
@@ -418,10 +440,9 @@ class SpeechToText:
         max_duration: float = 12.0,
         stop_event: threading.Event | None = None,
     ) -> np.ndarray:
-        """Capture microphone audio buffer until the user pauses or stops speaking.
+        """Capture microphone audio buffer until the user pauses or stops speaking."""
+        import sounddevice as sd
 
-        Uses RMS energy threshold to detect speech start and silence timeout to detect speech end.
-        """
         threshold = energy_threshold or getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.015)
         silence_limit = silence_duration or getattr(config, "SILENCE_DURATION", 0.8)
 
@@ -439,9 +460,7 @@ class SpeechToText:
             chunk = indata[:, 0].copy()
             audio_chunks.append(chunk)
 
-            # Compute RMS energy of this audio chunk
             rms = np.sqrt(np.mean(chunk**2))
-
             if rms >= threshold:
                 speech_started = True
                 silence_start_time = None
@@ -499,73 +518,13 @@ class VoicePipeline:
         self.tts = TextToSpeech()
 
     def listen(self, stop_event: threading.Event | None = None) -> str:
-        """Listen to the microphone and transcribe the user's spoken input."""
         return self.stt.listen(stop_event=stop_event)
 
     def speak(self, text: str, interrupt: bool = False) -> None:
-        """Speak a text string using neural TTS."""
         self.tts.speak(text, interrupt_current=interrupt)
 
     def speak_stream(self, token_stream: Iterable[str], interrupt: bool = False) -> None:
-        """Stream speech with sentence chunking for zero latency."""
         self.tts.speak_stream(token_stream, interrupt_current=interrupt)
 
     def interrupt(self) -> None:
-        """Barge-in: immediately cancel playback."""
         self.tts.interrupt()
-
-
-# ---------------------------------------------------------------------------
-# CLI Self-Test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("AI-ru Voice Engine Test CLI")
-    print("Commands:")
-    print("  speak <text>  : Test TTS synthesis & playback")
-    print("  stream <text> : Test sentence chunking streaming pipeline")
-    print("  listen        : Test microphone STT (Speak into your mic)")
-    print("  stop          : Test barge-in interruption")
-    print("  quit          : Exit")
-    print("=" * 60)
-
-    pipeline = VoicePipeline()
-
-    while True:
-        try:
-            line = input("voice> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
-            break
-
-        if not line:
-            continue
-        if line.lower() in {"q", "quit", "exit"}:
-            break
-        if line.lower().startswith("speak "):
-            to_say = line[6:].strip()
-            print(f"Synthesizing: '{to_say}'")
-            pipeline.speak(to_say)
-            continue
-        if line.lower().startswith("stream "):
-            text = line[7:].strip()
-
-            # Simulate streaming tokens from an LLM word by word
-            def fake_llm_stream(full_text: str):
-                for word in full_text.split(" "):
-                    yield word + " "
-                    time.sleep(0.04)
-
-            print("Streaming tokens to voice pipeline...")
-            pipeline.speak_stream(fake_llm_stream(text))
-            continue
-        if line.lower() in {"listen", "rec", "record"}:
-            print("Listening... (Speak into microphone now)")
-            result = pipeline.listen()
-            print(f"Recognized: '{result}'")
-            continue
-        if line.lower() in {"stop", "interrupt"}:
-            pipeline.interrupt()
-            print("Playback interrupted.")
-            continue

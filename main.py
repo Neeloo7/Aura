@@ -1,87 +1,124 @@
-"""AI-ru Companion: Terminal integration tying together config, os_tools, brain, and voice.
+"""AI-ru Companion: Ultra-responsive terminal companion loop.
 
-Supports:
-- Interactive text input & command interface
-- Native Ollama tool-calling for Windows OS operations (apps, volume, telemetry)
-- Real-time streaming response with clause-by-clause low-latency neural voice output
-- Microphone speech input toggle (/listen or /mic)
-- Immediate speech barge-in interruption (Ctrl+C during speech)
+Ties together config, os_tools, and brain with 100% non-blocking optional voice.
+- Zero audio/stream initialization at startup: starts instantly.
+- Voice output is DISABLED by default (enable anytime with /voice on).
+- Speech synthesis and playback run strictly in a detached background queue.
+- Main thread is never blocked: input() and Ctrl+C are always responsive.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import time
-from typing import List
+from typing import Any
+
+# Suppress pygame welcome prompt and configure console encoding
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+
+# Ensure UTF-8 encoding on Windows console to prevent UnicodeEncodeError in PowerShell
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 import config
 import os_tools
 from brain import Brain
-from voice import SentenceChunker, SpeechToText, TextToSpeech
 
 
 class AIRUCompanion:
-    """Ties together Ollama brain, OS execution tools, and real-time voice engine."""
+    """Ultra-responsive terminal companion tying Ollama, OS tools, and optional voice."""
 
-    def __init__(self, enable_voice: bool = True) -> None:
+    def __init__(self, enable_voice: bool = False) -> None:
         self.brain = Brain()
-        self.tts = TextToSpeech(voice=config.TTS_VOICE)
-        self.stt: SpeechToText | None = None  # Lazy-initialized on first /mic call
         self.voice_enabled = enable_voice
+        self._tts: Any = None
+        self._stt: Any = None
+        self._chunker: Any = None
 
-    def _get_stt(self) -> SpeechToText:
-        if self.stt is None:
+    def _get_tts(self) -> Any:
+        """Lazily initialize TextToSpeech engine on demand."""
+        if self._tts is None:
+            try:
+                from voice import SentenceChunker, TextToSpeech
+
+                self._tts = TextToSpeech(voice=config.TTS_VOICE)
+                self._chunker = SentenceChunker()
+            except Exception as exc:
+                print(f"\n[⚠️ Voice initialization warning: {exc}]")
+                self.voice_enabled = False
+        return self._tts
+
+    def _get_stt(self) -> Any:
+        """Lazily initialize SpeechToText engine on demand."""
+        if self._stt is None:
             print("[🎙️ Initializing Speech-to-Text engine...]")
-            self.stt = SpeechToText()
-        return self.stt
+            from voice import SpeechToText
+
+            self._stt = SpeechToText()
+        return self._stt
 
     def handle_query(self, user_text: str) -> None:
-        """Process user query through Ollama brain with streaming text and sentence-chunked voice."""
+        """Process user query through Ollama brain with real-time streaming output."""
         user_text = user_text.strip()
         if not user_text:
             return
 
-        # Stop any ongoing audio playback before answering new query (barge-in)
-        self.tts.interrupt()
+        # Interrupt any background audio if voice is active (barge-in)
+        if self._tts is not None:
+            self._tts.interrupt()
 
         print("\nAI-ru > ", end="", flush=True)
 
-        chunker = SentenceChunker()
         streamed_pieces: list[str] = []
+        chunker = None
+
+        if self.voice_enabled:
+            tts = self._get_tts()
+            if tts:
+                from voice import SentenceChunker
+
+                chunker = SentenceChunker()
 
         def on_token(token: str) -> None:
             streamed_pieces.append(token)
             sys.stdout.write(token)
             sys.stdout.flush()
 
-            if self.voice_enabled:
+            # Non-blocking sentence feed into background TTS worker
+            if self.voice_enabled and chunker and self._tts:
                 for sentence in chunker.feed(token):
-                    clean_sentence = sentence.strip()
-                    if clean_sentence:
-                        self.tts.speak(clean_sentence)
+                    clean = sentence.strip()
+                    if clean:
+                        self._tts.speak(clean)
 
         try:
             reply = self.brain.process_user_query(user_text, on_token=on_token)
 
-            # Flush any remaining sentence clause in the chunker buffer
-            if self.voice_enabled:
-                for remaining_sentence in chunker.flush():
-                    clean_sentence = remaining_sentence.strip()
-                    if clean_sentence:
-                        self.tts.speak(clean_sentence)
+            # Flush any remaining sentence in buffer to background voice queue
+            if self.voice_enabled and chunker and self._tts:
+                for tail in chunker.flush():
+                    clean = tail.strip()
+                    if clean:
+                        self._tts.speak(clean)
 
-            # If the response was not streamed piece-by-piece, display and speak reply directly
+            # Fallback if reply was not streamed piece-by-piece
             if not streamed_pieces:
                 print(reply, end="", flush=True)
-                if self.voice_enabled and reply:
-                    self.tts.speak(reply)
+                if self.voice_enabled and self._tts and reply:
+                    self._tts.speak(reply)
 
             print()
 
         except KeyboardInterrupt:
-            self.tts.interrupt()
-            print("\n[⏹️ Generation / speech interrupted]")
+            if self._tts is not None:
+                self._tts.interrupt()
+            print("\n[⏹️ Generation interrupted by user]")
         except Exception as exc:
             print(f"\n[❌ Error: {exc}]")
 
@@ -97,40 +134,41 @@ class AIRUCompanion:
                 self.handle_query(transcribed)
             else:
                 print("[No speech detected.]")
+        except KeyboardInterrupt:
+            print("\n[🎙️ Microphone listening cancelled]")
         except Exception as exc:
             print(f"[❌ Microphone STT Error: {exc}]")
 
     def print_banner(self) -> None:
+        voice_status = "ON (background)" if self.voice_enabled else "OFF (silent text mode)"
         print("=" * 66)
         print("       🤖  AI-ru (AURA Next-Gen) Terminal Companion  🤖       ")
         print("=" * 66)
         print(f" • Model       : {config.OLLAMA_MODEL}")
-        print(f" • Voice       : {config.TTS_VOICE} (Voice output: {'ON' if self.voice_enabled else 'OFF'})")
+        print(f" • Voice Output: {voice_status}")
         print(" • Tools       : Native OS Tool Execution (Apps, Volume, Stats)")
         print("-" * 66)
         print(" Commands:")
-        print("   /mic        : Speak via microphone (faster-whisper STT)")
-        print("   /voice on   : Enable real-time neural speech output")
+        print("   /voice on   : Enable real-time background neural speech")
         print("   /voice off  : Disable speech output (silent terminal mode)")
+        print("   /mic        : Speak query via microphone (faster-whisper STT)")
         print("   /stats      : Print live system hardware telemetry")
         print("   /tools      : List available OS automation tools")
-        print("   /clear      : Reset rolling conversation history")
+        print("   /clear      : Reset conversation history")
         print("   /help       : Show command help")
         print("   quit / exit : Exit companion")
-        print("   Ctrl + C    : Interrupt ongoing speech (Barge-In)")
         print("=" * 66 + "\n")
 
     def run_loop(self) -> None:
-        """Main terminal interaction loop."""
+        """Main terminal interaction loop. Never blocks on audio devices."""
         self.print_banner()
 
         while True:
             try:
                 line = input("You > ").strip()
             except KeyboardInterrupt:
-                # If audio is speaking, interrupt it; otherwise confirm quit
-                if self.tts.is_speaking():
-                    self.tts.interrupt()
+                if self._tts is not None and self._tts.is_speaking():
+                    self._tts.interrupt()
                     print("\n[🔇 Speech playback interrupted]")
                     continue
                 print("\nExiting AI-ru. Goodbye!")
@@ -144,10 +182,10 @@ class AIRUCompanion:
 
             lower = line.lower()
 
-            # Command dispatch
             if lower in {"q", "quit", "exit"}:
                 print("Exiting AI-ru. Goodbye!")
-                self.tts.interrupt()
+                if self._tts is not None:
+                    self._tts.interrupt()
                 break
 
             if lower in {"/mic", "/listen", "mic"}:
@@ -156,12 +194,14 @@ class AIRUCompanion:
 
             if lower in {"/voice on", "voice on"}:
                 self.voice_enabled = True
-                print("[🔊 Voice output enabled]")
+                self._get_tts()
+                print("[🔊 Background voice output enabled]")
                 continue
 
             if lower in {"/voice off", "voice off"}:
                 self.voice_enabled = False
-                self.tts.interrupt()
+                if self._tts is not None:
+                    self._tts.interrupt()
                 print("[🔇 Voice output disabled (silent mode)]")
                 continue
 
@@ -188,12 +228,13 @@ class AIRUCompanion:
                 self.print_banner()
                 continue
 
-            # Process regular text query through Ollama + tools + voice
+            # Regular query -> Ollama brain + tools
             self.handle_query(line)
 
 
 def main() -> None:
-    companion = AIRUCompanion(enable_voice=True)
+    # Voice output is disabled by default for maximum terminal responsiveness
+    companion = AIRUCompanion(enable_voice=False)
     companion.run_loop()
 
 
