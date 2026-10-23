@@ -1,9 +1,14 @@
-"""Ollama brain: streaming chat, native tool dispatch, sentence chunker."""
+"""Ollama brain: streaming chat, native tool dispatch, sentence chunker, and episodic memory."""
 
 from __future__ import annotations
 
 import json
+import threading
+import time
+import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import ollama
@@ -15,6 +20,117 @@ import os_tools
 _MAX_HISTORY_MESSAGES = 4
 
 TokenCallback = Callable[[str], None]
+ThoughtCallback = Callable[[str], None]
+
+
+class EpisodicMemory:
+    """Persistent episodic vector memory store backed by ChromaDB and SQLite in aura_memory."""
+
+    def __init__(self, memory_dir: str | Path | None = None) -> None:
+        if memory_dir is None:
+            self.memory_dir = Path(__file__).resolve().parent / "aura_memory"
+        else:
+            self.memory_dir = Path(memory_dir).resolve()
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self.client = None
+        self.collection = None
+        self._init_db()
+
+    def _init_db(self) -> None:
+        try:
+            import chromadb
+            self.client = chromadb.PersistentClient(path=str(self.memory_dir))
+            self.collection = self.client.get_or_create_collection(
+                name="chat_history",
+                metadata={"description": "AI-ru persistent episodic memory & user context"},
+            )
+        except Exception as exc:
+            print(f"[⚠️ EpisodicMemory init error: {exc}]")
+            self.client = None
+            self.collection = None
+
+    def query(self, query_text: str, n_results: int = 3) -> list[str]:
+        """Query the local SQLite/ChromaDB memory store for relevant past facts or user context."""
+        with self._lock:
+            if not self.collection:
+                return []
+            try:
+                count = self.collection.count()
+                if count == 0:
+                    return []
+                k = min(n_results, count)
+                results = self.collection.query(
+                    query_texts=[query_text],
+                    n_results=k,
+                )
+                documents = results.get("documents") or []
+                if documents and documents[0]:
+                    retrieved = [doc.strip() for doc in documents[0] if doc and doc.strip()]
+                    return retrieved
+                return []
+            except Exception as exc:
+                print(f"[⚠️ EpisodicMemory query error: {exc}]")
+                return []
+
+    def store_turn(self, user_text: str, assistant_text: str, metadata: dict | None = None) -> None:
+        """Store a conversation turn or fact into episodic memory."""
+        with self._lock:
+            if not self.collection:
+                return
+            u_clean = user_text.strip()
+            a_clean = assistant_text.strip()
+            if not u_clean:
+                return
+            doc = f"User: {u_clean}\nAI-ru: {a_clean}"
+            tid = f"mem_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+            meta = {
+                "timestamp": time.time(),
+                "datetime": datetime.now().isoformat(),
+            }
+            if metadata:
+                meta.update(metadata)
+            try:
+                self.collection.add(
+                    documents=[doc],
+                    ids=[tid],
+                    metadatas=[meta],
+                )
+            except Exception as exc:
+                print(f"[⚠️ EpisodicMemory store error: {exc}]")
+
+    def sync_sessions_if_empty(self, sessions_list: list[dict]) -> None:
+        """One-time sync of past session chronologies into ChromaDB if empty."""
+        with self._lock:
+            if not self.collection:
+                return
+            try:
+                if self.collection.count() == 0 and sessions_list:
+                    docs, ids, metas = [], [], []
+                    for sess in sessions_list:
+                        msgs = sess.get("msgs", [])
+                        i = 0
+                        while i < len(msgs):
+                            sender, text = msgs[i]
+                            if str(sender).lower() in {"user", "you", "me", "human"}:
+                                reply = ""
+                                if i + 1 < len(msgs) and str(msgs[i + 1][0]).lower() not in {"user", "you", "me", "human"}:
+                                    reply = msgs[i + 1][1]
+                                    i += 1
+                                doc = f"User: {text.strip()}\nAI-ru: {reply.strip()}"
+                                tid = f"hist_{sess.get('id', 0)}_{uuid.uuid4().hex[:8]}"
+                                docs.append(doc)
+                                ids.append(tid)
+                                metas.append({
+                                    "timestamp": float(sess.get("ts", time.time())),
+                                    "session_id": str(sess.get("id")),
+                                })
+                            i += 1
+                    if docs:
+                        self.collection.add(documents=docs, ids=ids, metadatas=metas)
+                        print(f"[🧠 EpisodicMemory synchronized {len(docs)} past session items into aura_memory]")
+            except Exception as exc:
+                print(f"[⚠️ EpisodicMemory sync error: {exc}]")
 
 
 def _as_dict(message: Any) -> dict:
@@ -63,9 +179,23 @@ def iter_sentence_chunks(text: str) -> Iterator[str]:
         yield leftover
 
 
-def _build_messages(user_text: str, chat_history: list[dict] | None) -> list[dict]:
+def _build_messages(
+    user_text: str,
+    chat_history: list[dict] | None,
+    memories: list[str] | None = None,
+) -> list[dict]:
+    system_content = config.SYSTEM_PROMPT
+    if memories:
+        formatted_memories = "\n".join(f"- {m.strip()}" for m in memories if m.strip())
+        system_content += (
+            f"\n\n[Retrieved Long-Term Episodic Memory & User Context]:\n"
+            f"{formatted_memories}\n"
+            f"Use these recalled episodic memories from aura_memory to recognize returning user context, "
+            f"maintain continuity across sessions/reboots, and answer personal inquiries naturally."
+        )
+
     recent = list(chat_history or [])[-_MAX_HISTORY_MESSAGES:]
-    messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": system_content}]
     messages.extend(recent)
     messages.append({"role": "user", "content": user_text})
     return messages
@@ -119,10 +249,11 @@ def _dispatch_tools(assistant_msg: Any) -> list[dict]:
 
 
 class Brain:
-    """Holds rolling chat history and talks to Ollama with OS tool dispatch."""
+    """Holds rolling chat history, episodic memory in aura_memory, and talks to Ollama with OS tool dispatch."""
 
-    def __init__(self) -> None:
+    def __init__(self, memory_dir: str | Path | None = None) -> None:
         self.history: list[dict] = []
+        self.memory = EpisodicMemory(memory_dir)
 
     def reset(self) -> None:
         self.history.clear()
@@ -133,9 +264,20 @@ class Brain:
         chat_history: list[dict] | None = None,
         *,
         on_token: TokenCallback | None = None,
+        on_thought: ThoughtCallback | None = None,
     ) -> str:
         history = self.history if chat_history is None else chat_history
-        messages = _build_messages(user_text, history)
+
+        # 1. Query episodic memory store for relevant past facts or user context
+        if on_thought:
+            on_thought("Searching episodic memory in aura_memory...")
+
+        memories = self.memory.query(user_text, n_results=3)
+        if memories and on_thought:
+            on_thought(f"Recalled {len(memories)} relevant past context item(s) from memory.")
+
+        # 2. Inject retrieved memories into system prompt dynamically
+        messages = _build_messages(user_text, history, memories=memories)
 
         try:
             response = _chat(messages, with_tools=True)
@@ -163,9 +305,17 @@ class Brain:
         if not final_text:
             final_text = "Done."
 
+        # Keep rolling in-memory window
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": final_text})
         del history[:-_MAX_HISTORY_MESSAGES]
+
+        # 3. Store conversation turn in persistent episodic memory store
+        try:
+            self.memory.store_turn(user_text, final_text)
+        except Exception as exc:
+            print(f"[⚠️ Memory store error: {exc}]")
+
         return final_text
 
 
@@ -177,9 +327,10 @@ def process_user_query(
     chat_history: list[dict] | None = None,
     *,
     on_token: TokenCallback | None = None,
+    on_thought: ThoughtCallback | None = None,
 ) -> str:
     """Run one user turn: Ollama → optional OS tools → spoken/text reply."""
-    return _brain.process_user_query(user_text, chat_history, on_token=on_token)
+    return _brain.process_user_query(user_text, chat_history, on_token=on_token, on_thought=on_thought)
 
 
 if __name__ == "__main__":

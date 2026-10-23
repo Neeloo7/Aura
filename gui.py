@@ -2041,17 +2041,25 @@ class BackendWorker(QThread):
     thought_ready = pyqtSignal(str)
     status_ready = pyqtSignal(str)
 
-    def __init__(self, user_text: str, chat_history: list[dict] | None = None):
+    def __init__(self, user_text: str, chat_history: list[dict] | None = None, brain: Brain | None = None):
         super().__init__()
         self.user_text = user_text
         self.chat_history = chat_history
-        self.brain = Brain()
+        self.brain = brain if brain is not None else Brain()
 
     def run(self):
         try:
             self.status_ready.emit("THINKING")
-            self.thought_ready.emit("Querying local Ollama brain...")
-            response = self.brain.process_user_query(self.user_text, chat_history=self.chat_history)
+
+            def _on_thought(th: str):
+                self.thought_ready.emit(th)
+
+            self.thought_ready.emit("Querying local Ollama brain & episodic memory...")
+            response = self.brain.process_user_query(
+                self.user_text,
+                chat_history=self.chat_history,
+                on_thought=_on_thought,
+            )
             self.status_ready.emit("SPEAKING")
             self.response_ready.emit(response)
         except Exception as e:
@@ -2148,6 +2156,12 @@ class AiruGUI(QWidget):
         self.sessions = load_sessions()[:200]
         self._sid = max([s["id"] for s in self.sessions], default=0)
         self.current = None
+
+        self.brain = Brain()
+        try:
+            self.brain.memory.sync_sessions_if_empty(self.sessions)
+        except Exception:
+            pass
 
         root = QHBoxLayout(self)
         self.root = root
@@ -2367,7 +2381,7 @@ class AiruGUI(QWidget):
                 role = "user" if is_user(sender) else "assistant"
                 chat_history.append({"role": role, "content": msg})
 
-        self.worker = BackendWorker(text, chat_history=chat_history)
+        self.worker = BackendWorker(text, chat_history=chat_history, brain=getattr(self, "brain", None))
         self.worker.status_ready.connect(self.update_status)
         self.worker.thought_ready.connect(self.add_thought)
         self.worker.response_ready.connect(self._on_backend_response)
