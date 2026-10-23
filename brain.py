@@ -187,6 +187,12 @@ def _build_messages(
     image_path: str | Path | None = None,
 ) -> list[dict]:
     system_content = config.SYSTEM_PROMPT
+    system_content += (
+        "\n\n[STRICT TOOL EXECUTION MANDATE]:\n"
+        "If the user asks about what is playing on Spotify/music, what window/app is open, "
+        "what is on their screen, or for visual desktop inspection, you MUST call capture_screen_context() IMMEDIATELY. "
+        "NEVER ask 'Would you like me to capture your screen?' or ask for permission — execute the tool immediately."
+    )
     if memories:
         formatted_memories = "\n".join(f"- {m.strip()}" for m in memories if m.strip())
         system_content += (
@@ -319,7 +325,7 @@ class Brain:
                 if cand.is_file():
                     messages.append({
                         "role": "user",
-                        "content": "Active screen context image captured. Please inspect the image and answer my query.",
+                        "content": f"The active screen was captured successfully into '{cand.name}'. Here is the visual image. Please inspect the image and directly answer my question: '{user_text}'.",
                         "images": [str(cand.resolve())],
                     })
 

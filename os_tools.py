@@ -544,45 +544,72 @@ def capture_screen_context(save_path: str | None = None) -> str:
     """Capture the current active screen state into a temporary 'screen_context.png'.
 
     Registered tool for Ollama screen vision and desktop context analysis.
+    Briefly hides any active AiruGUI window so it captures the actual desktop/Spotify
+    instead of the app's own UI window.
     """
+    import time
     target_path = Path(save_path) if save_path else Path(tempfile.gettempdir()) / "screen_context.png"
     target_path.parent.mkdir(parents=True, exist_ok=True)
     captured = False
+    hidden_windows: list[Any] = []
+    app = None
 
-    # Tier 1: Try PyQt6 grabWindow (guaranteed to work in active desktop GUI session)
+    # Hide any active AiruGUI windows briefly so we capture the true desktop/Spotify
     try:
         from PyQt6.QtWidgets import QApplication
-        from PyQt6.QtGui import QGuiApplication
-        import sys
-        _ = QApplication.instance() or QApplication(sys.argv)
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            pix = screen.grabWindow(0)
-            if not pix.isNull():
-                pix.save(str(target_path))
-                captured = True
+        app = QApplication.instance()
+        if app:
+            for w in app.topLevelWidgets():
+                if w.isVisible():
+                    hidden_windows.append(w)
+                    w.hide()
+            app.processEvents()
+            time.sleep(0.08)  # Let Windows DWM compositor paint underlying desktop windows
     except Exception:
         pass
 
-    # Tier 2: Try pyautogui
-    if not captured:
-        try:
-            import pyautogui
-            img = pyautogui.screenshot()
-            img.save(str(target_path))
-            captured = True
-        except Exception:
-            pass
+    try:
+        # Tier 1: Try PyQt6 grabWindow (guaranteed to work in active desktop GUI session)
+        if app:
+            try:
+                from PyQt6.QtGui import QGuiApplication
+                screen = QGuiApplication.primaryScreen()
+                if screen:
+                    pix = screen.grabWindow(0)
+                    if not pix.isNull():
+                        pix.save(str(target_path))
+                        captured = True
+            except Exception:
+                pass
 
-    # Tier 3: Try PIL ImageGrab
-    if not captured:
-        try:
-            from PIL import ImageGrab
-            img = ImageGrab.grab(all_screens=True)
-            img.save(str(target_path))
-            captured = True
-        except Exception as exc:
-            return f"Failed to capture screen context: {exc}"
+        # Tier 2: Try pyautogui
+        if not captured:
+            try:
+                import pyautogui
+                img = pyautogui.screenshot()
+                img.save(str(target_path))
+                captured = True
+            except Exception:
+                pass
+
+        # Tier 3: Try PIL ImageGrab
+        if not captured:
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(all_screens=True)
+                img.save(str(target_path))
+                captured = True
+            except Exception as exc:
+                return f"Failed to capture screen context: {exc}"
+    finally:
+        # Restore all previously visible windows immediately
+        if app and hidden_windows:
+            for w in hidden_windows:
+                try:
+                    w.show()
+                except Exception:
+                    pass
+            app.processEvents()
 
     if captured:
         try:
@@ -698,8 +725,9 @@ OLLAMA_TOOLS_SCHEMA: list[dict] = [
             "name": "capture_screen_context",
             "description": (
                 "Capture the current desktop screen into a temporary 'screen_context.png' for visual context "
-                "and UI analysis. Call this when the user asks what is on their screen, "
-                "to inspect an open document or application window, or to see what they are currently viewing."
+                "and UI analysis. Call this immediately whenever the user asks what is playing on Spotify or media, "
+                "what window or app is open, what is on their screen, or asks for visual inspection. "
+                "Never ask for permission or confirm first; invoke this tool immediately."
             ),
             "parameters": {
                 "type": "object",

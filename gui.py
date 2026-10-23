@@ -1847,12 +1847,21 @@ class MiniOrb(QWidget):
         text = self.entry.text().strip()
         self.close_ask()
         if text:
-            self.on_submit(text)
-            self.show_toast("Sent. Ai-ru is on it")
+            self.show_toast("Thinking...")
+            if callable(self.on_submit):
+                self.on_submit(text)
 
     def eventFilter(self, obj, ev):
-        if obj is self.entry and ev.type() == QEvent.Type.FocusOut and self.mode == "ask":
-            QTimer.singleShot(150, lambda: self.close_ask() if not self.entry.hasFocus() else None)
+        if obj is self.entry:
+            if ev.type() == QEvent.Type.KeyPress:
+                if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._submit()
+                    return True
+                elif ev.key() == Qt.Key.Key_Escape:
+                    self.close_ask()
+                    return True
+            elif ev.type() == QEvent.Type.FocusOut and self.mode == "ask":
+                QTimer.singleShot(150, lambda: self.close_ask() if not self.entry.hasFocus() else None)
         return super().eventFilter(obj, ev)
 
     def keyPressEvent(self, e):
@@ -2257,7 +2266,7 @@ class AiruGUI(QWidget):
         self.orb = MiniOrb(self.pres)
         self.orb.saved_right, self.orb.saved_y = settings.get("orb_right"), settings.get("orb_y")
         self.orb.on_restore, self.orb.on_quit, self.orb.on_mute = self._restore, self._quit, self._toggle_sound
-        self.orb.on_mic, self.orb.on_submit, self.orb.on_mode = self._toggle_mic, self._submit_text, self._cycle_orb_mode
+        self.orb.on_mic, self.orb.on_submit, self.orb.on_mode = self._toggle_mic, self._on_orb_submit, self._cycle_orb_mode
         self._build_tray()
 
         self._stage_anim = QVariantAnimation(self)
@@ -2431,6 +2440,18 @@ class AiruGUI(QWidget):
     def _on_backend_response(self, response_text):
         self.add_message("ai-ru", response_text)
         self.update_status("IDLE")
+        if hasattr(self, "orb") and self.orb.isVisible() and (not self.isVisible() or self.isMinimized()):
+            self.orb.show_toast(response_text)
+
+    def _on_orb_submit(self, text):
+        """Direct submission from MiniOrb capsule entry box when running in the background."""
+        text = text.strip()
+        if not text:
+            return
+        sfx("send")
+        self.pres.kick(1.0, shock=True)
+        self._do_add_message("user", text, quiet=True)
+        self._handle_backend_query(text)
 
     # ================= backend contract =================
     def update_status(self, state: str):
@@ -2593,6 +2614,8 @@ class AiruGUI(QWidget):
 
     def _show_thought(self, text):
         self.strip.set_thought(text)
+        if hasattr(self, "orb") and self.orb.isVisible() and (not self.isVisible() or self.isMinimized()):
+            self.orb.show_toast(text)
 
     def _do_notify(self, text):
         if self.orb.isVisible():
