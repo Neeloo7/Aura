@@ -61,13 +61,17 @@ _ABBREVIATIONS = {
 
 
 def clean_for_speech(text: str) -> str:
-    """Clean markdown, code blocks, and symbols for natural human speech."""
+    """Clean markdown, code blocks, and symbols for natural human speech, with phonetic replacements."""
     if not text:
         return ""
     clean = re.sub(r"```[\s\S]*?```", " Code snippet omitted. ", text)
     clean = re.sub(r"`([^`]+)`", r"\1", clean)
     clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
     clean = re.sub(r"[#*_~>]+", " ", clean)
+
+    # Phonetic pronunciation replacements: AI-ru / Ai-ru -> Eye-roo (Japanese 'ai' for love)
+    clean = re.sub(r"\b(?:ai[- ]?ru|airu)\b", "Eye-roo", clean, flags=re.IGNORECASE)
+
     clean = " ".join(clean.split())
     return clean
 
@@ -244,7 +248,9 @@ class TextToSpeech:
             return
         if interrupt_current:
             self.interrupt()
-        self._text_queue.put(text.strip())
+        clean = clean_for_speech(text)
+        if clean:
+            self._text_queue.put(clean)
 
     def speak_stream(self, token_stream: Iterable[str], interrupt_current: bool = False) -> None:
         """Non-blocking: chunks tokens and feeds completed sentences into background speech queue."""
@@ -260,7 +266,7 @@ class TextToSpeech:
 
     def synthesize_to_file(self, text: str, output_path: str | None = None) -> str:
         """Synthesize text to an audio file (using edge-tts with pyttsx3 fallback)."""
-        text = text.strip()
+        text = clean_for_speech(text)
         if not text:
             return ""
 
@@ -514,8 +520,8 @@ class SpeechToText:
         self,
         energy_threshold: float | None = None,
         silence_duration: float | None = None,
-        max_duration: float = 14.0,
-        initial_timeout: float = 4.5,
+        max_duration: float = 20.0,
+        initial_timeout: float = 5.0,
         stop_event: threading.Event | None = None,
         level_callback: Callable[[float], None] | None = None,
     ) -> np.ndarray:
@@ -527,7 +533,7 @@ class SpeechToText:
         import sounddevice as sd
 
         base_threshold = energy_threshold if energy_threshold is not None else getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.025)
-        silence_limit = silence_duration if silence_duration is not None else getattr(config, "SILENCE_DURATION", 0.8)
+        silence_limit = silence_duration if silence_duration is not None else getattr(config, "SILENCE_DURATION", 1.8)
 
         block_size = int(self.sample_rate * 0.05)  # 50ms blocks
         audio_chunks: list[np.ndarray] = []
