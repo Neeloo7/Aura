@@ -474,13 +474,18 @@ class SpeechToText:
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
+        vad_params = dict(
+            min_silence_duration_ms=getattr(config, "VAD_MIN_SILENCE_MS", 500),
+            speech_pad_ms=getattr(config, "VAD_SPEECH_PAD_MS", 250),
+        )
+
         try:
             segments, _ = self.model.transcribe(
                 audio,
                 language="en",
                 beam_size=1,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=300),
+                vad_parameters=vad_params,
             )
             texts = [segment.text.strip() for segment in segments if segment.text.strip()]
             return " ".join(texts).strip()
@@ -497,7 +502,7 @@ class SpeechToText:
                         language="en",
                         beam_size=1,
                         vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=300),
+                        vad_parameters=vad_params,
                     )
                     texts = [segment.text.strip() for segment in segments if segment.text.strip()]
                     return " ".join(texts).strip()
@@ -516,16 +521,18 @@ class SpeechToText:
     ) -> np.ndarray:
         """Capture microphone audio buffer until the user pauses or stops speaking.
 
-        Uses adaptive ambient calibration and configured SILENCE_DURATION to auto-conclude recording.
+        Uses adaptive ambient calibration, keyboard-click transient rejection,
+        and configured SILENCE_DURATION to auto-conclude recording cleanly.
         """
         import sounddevice as sd
 
-        base_threshold = energy_threshold if energy_threshold is not None else getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.015)
+        base_threshold = energy_threshold if energy_threshold is not None else getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.025)
         silence_limit = silence_duration if silence_duration is not None else getattr(config, "SILENCE_DURATION", 0.8)
 
         block_size = int(self.sample_rate * 0.05)  # 50ms blocks
         audio_chunks: list[np.ndarray] = []
         speech_started = False
+        consecutive_speech_blocks = 0
         silence_start_time: float | None = None
         start_time = time.time()
         phrase_done = threading.Event()
@@ -537,7 +544,7 @@ class SpeechToText:
         silence_threshold = base_threshold * 0.7
 
         def audio_callback(indata, frames, time_info, status):
-            nonlocal speech_started, silence_start_time, calibrated, speech_threshold, silence_threshold
+            nonlocal speech_started, consecutive_speech_blocks, silence_start_time, calibrated, speech_threshold, silence_threshold
             if (stop_event and stop_event.is_set()) or phrase_done.is_set():
                 raise sd.CallbackStop()
 
@@ -551,26 +558,31 @@ class SpeechToText:
                 except Exception:
                     pass
 
-            # Calibration on initial 150ms
+            # Calibration on initial 150ms (3 x 50ms blocks) to cancel fan hum
             if not calibrated:
                 calibration_samples.append(rms)
                 if len(calibration_samples) >= 3:
                     noise_floor = float(np.mean(calibration_samples))
-                    speech_threshold = max(base_threshold, noise_floor * 2.0)
+                    speech_threshold = max(base_threshold, noise_floor * 2.2)
                     silence_threshold = max(base_threshold * 0.7, noise_floor * 1.3)
                     calibrated = True
 
-            # Voice activity detection
+            # Voice activity detection with transient click filtering
             if rms >= speech_threshold:
-                speech_started = True
-                silence_start_time = None
-            elif speech_started:
-                if rms <= silence_threshold:
-                    if silence_start_time is None:
-                        silence_start_time = time.time()
-                    elif time.time() - silence_start_time >= silence_limit:
-                        phrase_done.set()
-                        raise sd.CallbackStop()
+                consecutive_speech_blocks += 1
+                # Require >= 2 consecutive 50ms blocks (>= 100ms) to filter transient keyboard clicks
+                if consecutive_speech_blocks >= 2:
+                    speech_started = True
+                    silence_start_time = None
+            else:
+                consecutive_speech_blocks = 0
+                if speech_started:
+                    if rms <= silence_threshold:
+                        if silence_start_time is None:
+                            silence_start_time = time.time()
+                        elif time.time() - silence_start_time >= silence_limit:
+                            phrase_done.set()
+                            raise sd.CallbackStop()
 
         try:
             with sd.InputStream(
