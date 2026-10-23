@@ -46,6 +46,7 @@ from pathlib import Path
 from brain import Brain
 from os_tools import execute_tool
 import numpy as np
+import psutil
 
 # Chromium flags must be set before Qt creates the web engine.
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--ignore-gpu-blocklist --enable-gpu-rasterization")
@@ -109,13 +110,15 @@ STATE_DEFS = {
     "LISTENING": dict(c1=(255, 72, 168), c2=(255, 150, 60), speed=0.55, hz=0.90, energy=0.75, label="listening"),
     "THINKING":  dict(c1=(150, 104, 255), c2=(70, 40, 230), speed=2.60, hz=2.20, energy=0.95, label="thinking"),
     "SPEAKING":  dict(c1=(48, 242, 172), c2=(0, 168, 124),  speed=0.80, hz=1.40, energy=0.62, label="speaking"),
+    "WARNING":   dict(c1=(255, 110, 20), c2=(220, 20, 60),  speed=1.60, hz=1.80, energy=0.90, label="warning: high cpu"),
 }
-ORB_STATE = {"IDLE": "idle", "LISTENING": "listening", "THINKING": "thinking", "SPEAKING": "speaking"}
+ORB_STATE = {"IDLE": "idle", "LISTENING": "listening", "THINKING": "thinking", "SPEAKING": "speaking", "WARNING": "thinking"}
 ALIASES = {
     "READY": "IDLE", "STANDBY": "IDLE", "SLEEPING": "IDLE", "SLEEP": "IDLE",
     "LISTEN": "LISTENING", "RECORDING": "LISTENING",
     "THINK": "THINKING", "PROCESSING": "THINKING", "BUSY": "THINKING", "WORKING": "THINKING",
     "SPEAK": "SPEAKING", "TALKING": "SPEAKING", "RESPONDING": "SPEAKING",
+    "WARN": "WARNING", "ALERT": "WARNING", "HIGH_CPU": "WARNING",
 }
 THEMES = {  # recolor IDLE (orb, aurora, accents); the other states keep their meaning
     "Neon":     ((26, 170, 255),  (0, 76, 210)),
@@ -124,6 +127,7 @@ THEMES = {  # recolor IDLE (orb, aurora, accents); the other states keep their m
     "Ice":      ((196, 226, 255), (96, 136, 214)),
     "Void":     ((150, 160, 255), (74, 62, 204)),
     "Mono":     ((236, 238, 244), (110, 114, 140)),
+    "Warning":  ((255, 110, 20),  (220, 20, 60)),
 }
 THEME_ORDER = list(THEMES)
 ORB_MODES = ("background", "always", "minimized")
@@ -2055,6 +2059,40 @@ class BackendWorker(QThread):
             self.response_ready.emit(f"Error processing query: {e}")
 
 
+class TelemetryWorker(QThread):
+    """Monitors system CPU and battery metrics in background every 5s."""
+    telemetry_updated = pyqtSignal(float, object)
+
+    def __init__(self, interval: float = 5.0):
+        super().__init__()
+        self.interval = interval
+        self._running = True
+
+    def run(self):
+        try:
+            psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+
+        while self._running:
+            elapsed = 0.0
+            while self._running and elapsed < self.interval:
+                self.msleep(200)
+                elapsed += 0.2
+            if not self._running:
+                break
+            try:
+                cpu = psutil.cpu_percent(interval=None)
+                batt = psutil.sensors_battery()
+                self.telemetry_updated.emit(float(cpu), batt)
+            except Exception:
+                pass
+
+    def stop(self):
+        self._running = False
+        self.wait(1000)
+
+
 # --------------------------------------------------------------------------------------
 # The main window
 # --------------------------------------------------------------------------------------
@@ -2259,6 +2297,62 @@ class AiruGUI(QWidget):
 
         # Trigger silent background warm-up of Ollama 7B model
         QTimer.singleShot(400, self._trigger_warmup)
+
+        # Autonomous system telemetry background monitor (CPU & Battery)
+        self._cpu_warning_active = False
+        self._saved_user_theme = self.theme
+        self._last_battery_alert = 0.0
+        self._telemetry_worker = TelemetryWorker(interval=5.0)
+        self._telemetry_worker.telemetry_updated.connect(self._on_telemetry)
+        self._telemetry_worker.start()
+
+    def _on_telemetry(self, cpu: float, batt):
+        # 1. CPU spike detection (> 85%)
+        if cpu >= 85.0:
+            if not self._cpu_warning_active:
+                self._cpu_warning_active = True
+                self._saved_user_theme = self.theme
+                self.update_status("WARNING")
+                warn_c1, warn_c2 = THEMES["Warning"]
+                self.orb_view.set_theme(warn_c1, warn_c2)
+                self.orb_view.set_aurora(warn_c1, warn_c2)
+                warn_msg = f"Warning: CPU usage is spiking high ({int(round(cpu))}%)."
+                if self.orb.isVisible():
+                    self.orb.show_toast(warn_msg)
+                else:
+                    self.orb.appear(warn_msg)
+                self.notify(warn_msg)
+        elif self._cpu_warning_active and cpu < 75.0:
+            # Recover when CPU drops below 75%
+            self._cpu_warning_active = False
+            self.update_status("IDLE")
+            saved_theme = getattr(self, "_saved_user_theme", self.theme)
+            if saved_theme in THEMES:
+                c1, c2 = THEMES[saved_theme]
+                self.orb_view.set_theme(c1, c2)
+                self.orb_view.set_aurora(c1, c2)
+            recover_msg = "CPU usage normalized."
+            if self.orb.isVisible():
+                self.orb.show_toast(recover_msg)
+            self.notify(recover_msg)
+
+        # 2. Battery status detection (< 20% and not plugged in)
+        if batt is not None:
+            pct = getattr(batt, "percent", 100.0)
+            plugged = getattr(batt, "power_plugged", True)
+            if pct < 20.0 and not plugged:
+                now = time.time()
+                # Cooldown of 300s (5 minutes) so it doesn't spam alerts every 5 seconds
+                if now - getattr(self, "_last_battery_alert", 0.0) > 300.0:
+                    self._last_battery_alert = now
+                    batt_msg = f"Warning: Battery level is critical ({int(round(pct))}%). Please connect power."
+                    if self.orb.isVisible():
+                        self.orb.show_toast(batt_msg)
+                    else:
+                        self.orb.appear(batt_msg)
+                    self.notify(batt_msg)
+            elif plugged:
+                self._last_battery_alert = 0.0
 
     def _trigger_warmup(self):
         self._warmup_worker = WarmupWorker()
@@ -2845,6 +2939,8 @@ class AiruGUI(QWidget):
 
     def _quit(self):
         self._quitting = True
+        if hasattr(self, "_telemetry_worker") and self._telemetry_worker.isRunning():
+            self._telemetry_worker.stop()
         self._save()
         self._save_settings()
         self.orb.hide()
