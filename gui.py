@@ -918,6 +918,9 @@ class IconButton(GlassButton):
         elif k == "menu":
             for y, x2 in ((-4.5, 6), (0, 3.5), (4.5, 6)):
                 p.drawLine(QPointF(-6, y), QPointF(x2, y))
+        elif k == "vision":
+            p.drawEllipse(QPointF(0, 0), 5.5, 3.5)
+            p.drawEllipse(QPointF(0, 0), 1.8, 1.8)
         elif k == "search":
             p.drawEllipse(QPointF(-1.5, -1.5), 4.6, 4.6)
             p.drawLine(QPointF(1.8, 1.8), QPointF(5.5, 5.5))
@@ -1070,10 +1073,12 @@ class InputDock(QWidget):
         self.entry.setFont(make_font(12.5))
         self.entry.setPlaceholderText("Message Ai-ru")
         self.entry.setFrame(False)
-        self.entry.installEventFilter(self)
+        self.vision = IconButton(pres, "vision")
+        self.vision.setToolTip("Analyze screen (Ctrl+Shift+V)")
         self.mic = MicButton(pres)
         self.send = SendButton(pres)
         lay.addWidget(self.entry, 1)
+        lay.addWidget(self.vision)
         lay.addWidget(self.mic)
         lay.addWidget(self.send)
         self._anim = QVariantAnimation(self)
@@ -2041,11 +2046,18 @@ class BackendWorker(QThread):
     thought_ready = pyqtSignal(str)
     status_ready = pyqtSignal(str)
 
-    def __init__(self, user_text: str, chat_history: list[dict] | None = None, brain: Brain | None = None):
+    def __init__(
+        self,
+        user_text: str,
+        chat_history: list[dict] | None = None,
+        brain: Brain | None = None,
+        image_path: str | None = None,
+    ):
         super().__init__()
         self.user_text = user_text
         self.chat_history = chat_history
         self.brain = brain if brain is not None else Brain()
+        self.image_path = image_path
 
     def run(self):
         try:
@@ -2054,11 +2066,16 @@ class BackendWorker(QThread):
             def _on_thought(th: str):
                 self.thought_ready.emit(th)
 
-            self.thought_ready.emit("Querying local Ollama brain & episodic memory...")
+            if self.image_path:
+                self.thought_ready.emit("Analyzing screen capture with vision model...")
+            else:
+                self.thought_ready.emit("Querying local Ollama brain & episodic memory...")
+
             response = self.brain.process_user_query(
                 self.user_text,
                 chat_history=self.chat_history,
                 on_thought=_on_thought,
+                image_path=self.image_path,
             )
             self.status_ready.emit("SPEAKING")
             self.response_ready.emit(response)
@@ -2283,7 +2300,9 @@ class AiruGUI(QWidget):
         self._thought_sig.connect(self._show_thought, Qt.ConnectionType.QueuedConnection)
         self._notify_sig.connect(self._do_notify, Qt.ConnectionType.QueuedConnection)
         self._wake_sig.connect(self._do_wake, Qt.ConnectionType.QueuedConnection)
+        self.dock.vision.clicked.connect(lambda: self._analyze_screen())
         for keys, fn in (("Ctrl+K", self._open_palette), ("F11", self._toggle_fullscreen), ("F2", self._toggle_presence),
+                         ("Ctrl+Shift+V", self._analyze_screen), ("F3", self._analyze_screen),
                          ("Ctrl+B", self._toggle_sidebar), ("Ctrl+T", self._cycle_theme), ("Ctrl+E", self._export),
                          ("Ctrl+N", self._new_session), ("Ctrl+M", self._toggle_mic), ("Ctrl+Space", self._toggle_mic),
                          ("Ctrl+Shift+S", self._toggle_sound), ("Ctrl+Shift+O", self._cycle_orb_mode),
@@ -2372,7 +2391,7 @@ class AiruGUI(QWidget):
         self._warmup_worker = WarmupWorker()
         self._warmup_worker.start()
 
-    def _handle_backend_query(self, text):
+    def _handle_backend_query(self, text, image_path: str | None = None):
         self.update_status("THINKING")
         chat_history = []
         if hasattr(self, "current") and "msgs" in self.current:
@@ -2381,11 +2400,33 @@ class AiruGUI(QWidget):
                 role = "user" if is_user(sender) else "assistant"
                 chat_history.append({"role": role, "content": msg})
 
-        self.worker = BackendWorker(text, chat_history=chat_history, brain=getattr(self, "brain", None))
+        self.worker = BackendWorker(
+            text,
+            chat_history=chat_history,
+            brain=getattr(self, "brain", None),
+            image_path=image_path,
+        )
         self.worker.status_ready.connect(self.update_status)
         self.worker.thought_ready.connect(self.add_thought)
         self.worker.response_ready.connect(self._on_backend_response)
         self.worker.start()
+
+    def _analyze_screen(self, custom_prompt: str | None = None):
+        """Capture active screen context and query Ollama backend with vision."""
+        sfx("whoosh")
+        self.pres.kick(0.8, shock=True)
+        self._toast("Capturing screen for live vision analysis...")
+        QApplication.processEvents()
+        from os_tools import capture_screen_context
+
+        capture_screen_context()
+        screen_path = "screen_context.png"
+        if not Path(screen_path).is_file():
+            screen_path = str(Path(tempfile.gettempdir()) / "screen_context.png")
+
+        prompt = custom_prompt or "Analyze what is on my screen right now. Describe the active windows, visible content, and any notable context."
+        self._do_add_message("user", f"👁️ [Screen Vision]: {prompt}", quiet=True)
+        self._handle_backend_query(prompt, image_path=screen_path)
 
     def _on_backend_response(self, response_text):
         self.add_message("ai-ru", response_text)
@@ -2908,6 +2949,7 @@ class AiruGUI(QWidget):
 
     def _palette_commands(self):
         cmds = [
+            ("Analyze my screen (Live screen vision)", "Ctrl+Shift+V", self._analyze_screen),
             ("Toggle mic (listening mode)", "Ctrl+Space", self._toggle_mic),
             ("Wake Ai-ru (test the wake word)", "", self._do_wake),
             ("New session", "Ctrl+N", self._new_session),

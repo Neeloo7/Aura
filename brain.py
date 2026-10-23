@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import threading
 import time
 import uuid
@@ -183,6 +184,7 @@ def _build_messages(
     user_text: str,
     chat_history: list[dict] | None,
     memories: list[str] | None = None,
+    image_path: str | Path | None = None,
 ) -> list[dict]:
     system_content = config.SYSTEM_PROMPT
     if memories:
@@ -197,7 +199,14 @@ def _build_messages(
     recent = list(chat_history or [])[-_MAX_HISTORY_MESSAGES:]
     messages: list[dict] = [{"role": "system", "content": system_content}]
     messages.extend(recent)
-    messages.append({"role": "user", "content": user_text})
+
+    user_msg: dict[str, Any] = {"role": "user", "content": user_text}
+    if image_path:
+        p = Path(image_path).resolve()
+        if p.is_file():
+            user_msg["images"] = [str(p)]
+
+    messages.append(user_msg)
     return messages
 
 
@@ -265,19 +274,23 @@ class Brain:
         *,
         on_token: TokenCallback | None = None,
         on_thought: ThoughtCallback | None = None,
+        image_path: str | Path | None = None,
     ) -> str:
         history = self.history if chat_history is None else chat_history
 
         # 1. Query episodic memory store for relevant past facts or user context
         if on_thought:
-            on_thought("Searching episodic memory in aura_memory...")
+            if image_path:
+                on_thought("Analyzing active screen context with vision model...")
+            else:
+                on_thought("Searching episodic memory in aura_memory...")
 
         memories = self.memory.query(user_text, n_results=3)
-        if memories and on_thought:
+        if memories and on_thought and not image_path:
             on_thought(f"Recalled {len(memories)} relevant past context item(s) from memory.")
 
-        # 2. Inject retrieved memories into system prompt dynamically
-        messages = _build_messages(user_text, history, memories=memories)
+        # 2. Inject retrieved memories and screen vision image into messages
+        messages = _build_messages(user_text, history, memories=memories, image_path=image_path)
 
         try:
             response = _chat(messages, with_tools=True)
@@ -291,7 +304,25 @@ class Brain:
         messages.append(_as_dict(assistant_msg))
 
         if _tool_calls_of(assistant_msg):
+            tool_calls = _tool_calls_of(assistant_msg)
             messages.extend(_dispatch_tools(assistant_msg))
+
+            # If tool captured screen context, attach the screenshot to the follow-up request
+            screen_captured = any(
+                _call_name_and_args(call)[0] in {"capture_screen_context", "screen_context"}
+                for call in tool_calls
+            )
+            if screen_captured:
+                cand = Path("screen_context.png")
+                if not cand.is_file():
+                    cand = Path(tempfile.gettempdir()) / "screen_context.png"
+                if cand.is_file():
+                    messages.append({
+                        "role": "user",
+                        "content": "Active screen context image captured. Please inspect the image and answer my query.",
+                        "images": [str(cand.resolve())],
+                    })
+
             try:
                 final_text = _stream_chat(messages, on_token)
             except Exception as exc:
@@ -328,9 +359,16 @@ def process_user_query(
     *,
     on_token: TokenCallback | None = None,
     on_thought: ThoughtCallback | None = None,
+    image_path: str | Path | None = None,
 ) -> str:
     """Run one user turn: Ollama → optional OS tools → spoken/text reply."""
-    return _brain.process_user_query(user_text, chat_history, on_token=on_token, on_thought=on_thought)
+    return _brain.process_user_query(
+        user_text,
+        chat_history,
+        on_token=on_token,
+        on_thought=on_thought,
+        image_path=image_path,
+    )
 
 
 if __name__ == "__main__":

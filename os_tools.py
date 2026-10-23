@@ -545,30 +545,54 @@ def capture_screen_context(save_path: str | None = None) -> str:
 
     Registered tool for Ollama screen vision and desktop context analysis.
     """
+    target_path = Path(save_path) if save_path else Path(tempfile.gettempdir()) / "screen_context.png"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    captured = False
+
+    # Tier 1: Try PyQt6 grabWindow (guaranteed to work in active desktop GUI session)
     try:
-        import pyautogui
-    except ImportError:
-        return "Screen vision failed: pyautogui is not installed."
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtGui import QGuiApplication
+        import sys
+        _ = QApplication.instance() or QApplication(sys.argv)
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            pix = screen.grabWindow(0)
+            if not pix.isNull():
+                pix.save(str(target_path))
+                captured = True
+    except Exception:
+        pass
 
-    try:
-        if save_path:
-            target_path = Path(save_path)
-        else:
-            target_path = Path(tempfile.gettempdir()) / "screen_context.png"
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        img = pyautogui.screenshot()
-        img.save(str(target_path))
-
-        # Also update local working copy for direct model/file access
+    # Tier 2: Try pyautogui
+    if not captured:
         try:
-            img.save("screen_context.png")
+            import pyautogui
+            img = pyautogui.screenshot()
+            img.save(str(target_path))
+            captured = True
         except Exception:
             pass
 
+    # Tier 3: Try PIL ImageGrab
+    if not captured:
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grab(all_screens=True)
+            img.save(str(target_path))
+            captured = True
+        except Exception as exc:
+            return f"Failed to capture screen context: {exc}"
+
+    if captured:
+        try:
+            import shutil
+            shutil.copy2(str(target_path), "screen_context.png")
+        except Exception:
+            pass
         return f"Active screen context captured and saved to '{target_path.resolve()}'."
-    except Exception as exc:
-        return f"Failed to capture screen context: {exc}"
+
+    return "Failed to capture screen context."
 
 
 def system_control(action: str) -> str:
