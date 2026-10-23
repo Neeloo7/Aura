@@ -2154,8 +2154,11 @@ class STTWorker(QThread):
             )
             if not self._stop_event.is_set():
                 self.text_transcribed.emit((text or "").strip())
+            else:
+                self.text_transcribed.emit("")
         except Exception as exc:
             print(f"[⚠️ STTWorker error: {exc}]")
+            self.text_transcribed.emit("")
         finally:
             self.status_updated.emit("IDLE")
 

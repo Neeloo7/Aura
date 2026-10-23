@@ -420,17 +420,27 @@ class SpeechToText:
 
     @staticmethod
     def _resolve_device(device_pref: str, compute_pref: str) -> tuple[str, str]:
-        """Resolve CUDA vs CPU availability with optimal quantization."""
+        """Resolve CUDA vs CPU availability with optimal quantization and library presence check."""
         if device_pref == "cuda":
-            return "cuda", compute_pref
+            try:
+                import ctypes
+                ctypes.cdll.LoadLibrary("cublas64_12.dll")
+                return "cuda", compute_pref
+            except Exception:
+                return "cpu", "int8"
         if device_pref == "cpu":
             return "cpu", "int8"
 
         try:
             import ctranslate2
+            import ctypes
 
             if ctranslate2.get_cuda_device_count() > 0:
-                return "cuda", "int8_float16" if compute_pref == "int8" else compute_pref
+                try:
+                    ctypes.cdll.LoadLibrary("cublas64_12.dll")
+                    return "cuda", "int8_float16" if compute_pref == "int8" else compute_pref
+                except Exception:
+                    pass
         except Exception:
             pass
         return "cpu", "int8"
@@ -440,16 +450,21 @@ class SpeechToText:
         from faster_whisper import WhisperModel
 
         try:
-            return WhisperModel(
+            model = WhisperModel(
                 self.model_size,
                 device=self.device,
                 compute_type=self.compute_type,
             )
+            # If CUDA selected, dry-run verify runtime encoder execution
+            if self.device == "cuda":
+                dummy = np.zeros(4000, dtype=np.float32)
+                _ = list(model.transcribe(dummy, beam_size=1)[0])
+            return model
         except Exception:
             # Fallback to CPU int8 if CUDA libraries or drivers fail
             self.device = "cpu"
             self.compute_type = "int8"
-            return WhisperModel("tiny.en", device="cpu", compute_type="int8")
+            return WhisperModel(self.model_size or "tiny.en", device="cpu", compute_type="int8")
 
     def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe a 16kHz float32 audio buffer into text with sub-200ms latency."""
@@ -459,39 +474,71 @@ class SpeechToText:
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
 
-        segments, _ = self.model.transcribe(
-            audio,
-            language="en",
-            beam_size=1,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400),
-        )
-        texts = [segment.text.strip() for segment in segments if segment.text.strip()]
-        return " ".join(texts).strip()
+        try:
+            segments, _ = self.model.transcribe(
+                audio,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=300),
+            )
+            texts = [segment.text.strip() for segment in segments if segment.text.strip()]
+            return " ".join(texts).strip()
+        except Exception:
+            # Seamless fallback to CPU if CUDA runtime library fails dynamically
+            if self.device != "cpu":
+                self.device = "cpu"
+                self.compute_type = "int8"
+                from faster_whisper import WhisperModel
+                self._model = WhisperModel(self.model_size or "tiny.en", device="cpu", compute_type="int8")
+                try:
+                    segments, _ = self._model.transcribe(
+                        audio,
+                        language="en",
+                        beam_size=1,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=300),
+                    )
+                    texts = [segment.text.strip() for segment in segments if segment.text.strip()]
+                    return " ".join(texts).strip()
+                except Exception:
+                    return ""
+            return ""
 
     def record_phrase(
         self,
         energy_threshold: float | None = None,
         silence_duration: float | None = None,
-        max_duration: float = 12.0,
+        max_duration: float = 14.0,
+        initial_timeout: float = 4.5,
         stop_event: threading.Event | None = None,
         level_callback: Callable[[float], None] | None = None,
     ) -> np.ndarray:
-        """Capture microphone audio buffer until the user pauses or stops speaking."""
+        """Capture microphone audio buffer until the user pauses or stops speaking.
+
+        Uses adaptive ambient calibration and configured SILENCE_DURATION to auto-conclude recording.
+        """
         import sounddevice as sd
 
-        threshold = energy_threshold or getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.015)
-        silence_limit = silence_duration or getattr(config, "SILENCE_DURATION", 0.8)
+        base_threshold = energy_threshold if energy_threshold is not None else getattr(config, "AUDIO_ENERGY_THRESHOLD", 0.015)
+        silence_limit = silence_duration if silence_duration is not None else getattr(config, "SILENCE_DURATION", 0.8)
 
         block_size = int(self.sample_rate * 0.05)  # 50ms blocks
         audio_chunks: list[np.ndarray] = []
         speech_started = False
         silence_start_time: float | None = None
         start_time = time.time()
+        phrase_done = threading.Event()
+
+        # Dynamic ambient noise calibration
+        calibration_samples: list[float] = []
+        calibrated = False
+        speech_threshold = base_threshold
+        silence_threshold = base_threshold * 0.7
 
         def audio_callback(indata, frames, time_info, status):
-            nonlocal speech_started, silence_start_time
-            if stop_event and stop_event.is_set():
+            nonlocal speech_started, silence_start_time, calibrated, speech_threshold, silence_threshold
+            if (stop_event and stop_event.is_set()) or phrase_done.is_set():
                 raise sd.CallbackStop()
 
             chunk = indata[:, 0].copy()
@@ -504,29 +551,52 @@ class SpeechToText:
                 except Exception:
                     pass
 
-            if rms >= threshold:
+            # Calibration on initial 150ms
+            if not calibrated:
+                calibration_samples.append(rms)
+                if len(calibration_samples) >= 3:
+                    noise_floor = float(np.mean(calibration_samples))
+                    speech_threshold = max(base_threshold, noise_floor * 2.0)
+                    silence_threshold = max(base_threshold * 0.7, noise_floor * 1.3)
+                    calibrated = True
+
+            # Voice activity detection
+            if rms >= speech_threshold:
                 speech_started = True
                 silence_start_time = None
             elif speech_started:
-                if silence_start_time is None:
-                    silence_start_time = time.time()
+                if rms <= silence_threshold:
+                    if silence_start_time is None:
+                        silence_start_time = time.time()
+                    elif time.time() - silence_start_time >= silence_limit:
+                        phrase_done.set()
+                        raise sd.CallbackStop()
 
-        with sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=block_size,
-            callback=audio_callback,
-        ):
-            while True:
-                if stop_event and stop_event.is_set():
-                    break
-                if speech_started and silence_start_time:
-                    if time.time() - silence_start_time >= silence_limit:
+        try:
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=block_size,
+                callback=audio_callback,
+            ):
+                while not phrase_done.is_set():
+                    if stop_event and stop_event.is_set():
                         break
-                if time.time() - start_time >= max_duration:
-                    break
-                time.sleep(0.02)
+                    now = time.time()
+                    if speech_started and silence_start_time:
+                        if now - silence_start_time >= silence_limit:
+                            phrase_done.set()
+                            break
+                    if not speech_started and (now - start_time >= initial_timeout):
+                        phrase_done.set()
+                        break
+                    if now - start_time >= max_duration:
+                        phrase_done.set()
+                        break
+                    time.sleep(0.015)
+        except Exception:
+            pass
 
         if not audio_chunks:
             return np.array([], dtype=np.float32)
