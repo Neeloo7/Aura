@@ -60,6 +60,18 @@ _ABBREVIATIONS = {
 }
 
 
+def clean_for_speech(text: str) -> str:
+    """Clean markdown, code blocks, and symbols for natural human speech."""
+    if not text:
+        return ""
+    clean = re.sub(r"```[\s\S]*?```", " Code snippet omitted. ", text)
+    clean = re.sub(r"`([^`]+)`", r"\1", clean)
+    clean = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", clean)
+    clean = re.sub(r"[#*_~>]+", " ", clean)
+    clean = " ".join(clean.split())
+    return clean
+
+
 class SentenceChunker:
     """Buffers streaming token stream and yields complete sentences on punctuation (.!?).
 
@@ -151,9 +163,11 @@ class TextToSpeech:
         self,
         voice: str | None = None,
         use_edge: bool = True,
+        on_playback_state: Callable[[bool], None] | None = None,
     ) -> None:
         self.voice = voice or getattr(config, "TTS_VOICE", "en-US-AriaNeural")
         self.use_edge = use_edge
+        self.on_playback_state = on_playback_state
 
         self._mixer_lock = threading.Lock()
         self._mixer_initialized = False
@@ -213,6 +227,11 @@ class TextToSpeech:
                 break
 
         self._is_speaking = False
+        if self.on_playback_state:
+            try:
+                self.on_playback_state(False)
+            except Exception:
+                pass
         self._interrupt_event.clear()
 
     def is_speaking(self) -> bool:
@@ -294,6 +313,11 @@ class TextToSpeech:
                 self._text_queue.task_done()
                 continue
 
+            if self._is_speaking is False and self.on_playback_state:
+                try:
+                    self.on_playback_state(True)
+                except Exception:
+                    pass
             self._is_speaking = True
             audio_path = ""
             try:
@@ -302,8 +326,14 @@ class TextToSpeech:
                 if not audio_path or self._interrupt_event.is_set():
                     if audio_path:
                         self._safe_remove(audio_path)
-                    self._is_speaking = False
                     self._text_queue.task_done()
+                    if self._text_queue.empty():
+                        self._is_speaking = False
+                        if self.on_playback_state:
+                            try:
+                                self.on_playback_state(False)
+                            except Exception:
+                                pass
                     continue
 
                 # 2. Play audio via pygame mixer
@@ -335,8 +365,14 @@ class TextToSpeech:
             finally:
                 if audio_path:
                     self._safe_remove(audio_path)
-                self._is_speaking = False
                 self._text_queue.task_done()
+                if self._text_queue.empty():
+                    self._is_speaking = False
+                    if self.on_playback_state:
+                        try:
+                            self.on_playback_state(False)
+                        except Exception:
+                            pass
 
     @staticmethod
     def _safe_remove(path: str) -> None:
@@ -439,6 +475,7 @@ class SpeechToText:
         silence_duration: float | None = None,
         max_duration: float = 12.0,
         stop_event: threading.Event | None = None,
+        level_callback: Callable[[float], None] | None = None,
     ) -> np.ndarray:
         """Capture microphone audio buffer until the user pauses or stops speaking."""
         import sounddevice as sd
@@ -460,7 +497,13 @@ class SpeechToText:
             chunk = indata[:, 0].copy()
             audio_chunks.append(chunk)
 
-            rms = np.sqrt(np.mean(chunk**2))
+            rms = float(np.sqrt(np.mean(chunk**2)))
+            if level_callback:
+                try:
+                    level_callback(float(min(1.0, rms * 15.0)))
+                except Exception:
+                    pass
+
             if rms >= threshold:
                 speech_started = True
                 silence_start_time = None
@@ -495,12 +538,14 @@ class SpeechToText:
         energy_threshold: float | None = None,
         silence_duration: float | None = None,
         stop_event: threading.Event | None = None,
+        level_callback: Callable[[float], None] | None = None,
     ) -> str:
         """Listen from the microphone, record a phrase, and return the transcribed text."""
         audio = self.record_phrase(
             energy_threshold=energy_threshold,
             silence_duration=silence_duration,
             stop_event=stop_event,
+            level_callback=level_callback,
         )
         return self.transcribe(audio)
 

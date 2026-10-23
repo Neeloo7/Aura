@@ -36,9 +36,11 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import wave
@@ -2127,6 +2129,41 @@ class TelemetryWorker(QThread):
         self.wait(1000)
 
 
+class STTWorker(QThread):
+    """Background recording loop transcribing microphone input via faster-whisper."""
+    text_transcribed = pyqtSignal(str)
+    audio_level = pyqtSignal(float)
+    status_updated = pyqtSignal(str)
+
+    def __init__(self, stt: Any):
+        super().__init__()
+        self.stt = stt
+        self._stop_event = threading.Event()
+
+    def run(self):
+        self._stop_event.clear()
+        try:
+            self.status_updated.emit("LISTENING")
+
+            def _on_level(lvl: float):
+                self.audio_level.emit(lvl)
+
+            text = self.stt.listen(
+                stop_event=self._stop_event,
+                level_callback=_on_level,
+            )
+            if not self._stop_event.is_set():
+                self.text_transcribed.emit((text or "").strip())
+        except Exception as exc:
+            print(f"[⚠️ STTWorker error: {exc}]")
+        finally:
+            self.status_updated.emit("IDLE")
+
+    def stop(self):
+        self._stop_event.set()
+        self.wait(1000)
+
+
 # --------------------------------------------------------------------------------------
 # The main window
 # --------------------------------------------------------------------------------------
@@ -2188,6 +2225,12 @@ class AiruGUI(QWidget):
             self.brain.memory.sync_sessions_if_empty(self.sessions)
         except Exception:
             pass
+
+        # Real-time Voice Pipeline (STT & TTS)
+        self._stt = None
+        self._tts = None
+        self._stt_worker = None
+        self._init_voice_pipeline()
 
         root = QHBoxLayout(self)
         self.root = root
@@ -2443,6 +2486,65 @@ class AiruGUI(QWidget):
         if hasattr(self, "orb") and self.orb.isVisible() and (not self.isVisible() or self.isMinimized()):
             self.orb.show_toast(response_text)
 
+        # Pass AI response to neural TTS engine to speak out loud
+        if getattr(self, "_tts", None) is not None and response_text:
+            clean_speech = self._clean_for_speech(response_text)
+            if clean_speech:
+                self._tts.speak(clean_speech)
+
+    def _clean_for_speech(self, text: str) -> str:
+        """Strip markdown syntax and code blocks so edge-tts speaks natural human sentences."""
+        try:
+            from voice import clean_for_speech
+            return clean_for_speech(text)
+        except Exception:
+            return " ".join(text.split())
+
+    def _init_voice_pipeline(self):
+        """Initialize background STT and TTS engines."""
+        try:
+            from voice import SpeechToText, TextToSpeech
+
+            def _on_playback(speaking: bool):
+                self.update_status("SPEAKING" if speaking else "IDLE")
+
+            self._stt = SpeechToText()
+            self._tts = TextToSpeech(on_playback_state=_on_playback)
+        except Exception as exc:
+            print(f"[⚠️ Voice pipeline initialization notice: {exc}]")
+
+    def _start_stt_worker(self):
+        """Start faster-whisper recording loop in background."""
+        if self._stt is None:
+            self._init_voice_pipeline()
+        if self._stt is None:
+            self._toast("Microphone initialization failed.")
+            self._set_mic_ui(False)
+            return
+
+        self._stop_stt_worker()
+        self._stt_worker = STTWorker(self._stt)
+        self._stt_worker.audio_level.connect(self.set_audio_level)
+        self._stt_worker.text_transcribed.connect(self._on_speech_transcribed)
+        self._stt_worker.status_updated.connect(self.update_status)
+        self._stt_worker.start()
+
+    def _stop_stt_worker(self):
+        """Stop background recording loop."""
+        if hasattr(self, "_stt_worker") and self._stt_worker and self._stt_worker.isRunning():
+            self._stt_worker.stop()
+            self._stt_worker = None
+
+    def _on_speech_transcribed(self, text: str):
+        """Handle speech transcribed from microphone."""
+        text = text.strip()
+        self._set_mic_ui(False)
+        self.update_status("IDLE")
+        if text:
+            self._submit_text(text)
+        else:
+            self._toast("No speech detected.")
+
     def _on_orb_submit(self, text):
         """Direct submission from MiniOrb capsule entry box when running in the background."""
         text = text.strip()
@@ -2610,6 +2712,15 @@ class AiruGUI(QWidget):
             self.backend_state = "IDLE"
         self._set_mic_ui(on)
         self._refresh_state(silent=True)
+
+        if on:
+            # Barge-in: interrupt any playing speech synthesis
+            if hasattr(self, "_tts") and self._tts:
+                self._tts.interrupt()
+            self._start_stt_worker()
+        else:
+            self._stop_stt_worker()
+
         safe_call(self._on_mic, on)
 
     def _show_thought(self, text):
@@ -3018,6 +3129,9 @@ class AiruGUI(QWidget):
 
     def _quit(self):
         self._quitting = True
+        self._stop_stt_worker()
+        if hasattr(self, "_tts") and self._tts:
+            self._tts.interrupt()
         if hasattr(self, "_telemetry_worker") and self._telemetry_worker.isRunning():
             self._telemetry_worker.stop()
         self._save()
